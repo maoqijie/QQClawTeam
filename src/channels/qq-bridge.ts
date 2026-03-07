@@ -563,7 +563,21 @@ export class QQBridgeChannel implements Channel {
     return jid.startsWith('qq:');
   }
 
-  sendMessage(jid: string, text: string): Promise<void> {
+  async sendMessage(jid: string, text: string): Promise<void> {
+    // If fleet manager is available, send directly via NapCat connector
+    if (this.fleetManager) {
+      const parsed = parseQqJid(jid);
+      const mainConnector = this.fleetManager.getMainConnector();
+      if (mainConnector) {
+        if (parsed.chatType === 'group') {
+          await mainConnector.sendGroupMsg(parsed.chatId, text);
+        } else {
+          await mainConnector.sendPrivateMsg(parsed.chatId, text);
+        }
+        return;
+      }
+    }
+    // Fallback to outbound dispatcher
     return this.dispatcher.enqueue({ kind: 'message', jid, text });
   }
 

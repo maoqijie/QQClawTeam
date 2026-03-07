@@ -1,6 +1,9 @@
 /**
  * NapCat Fleet Manager
- * Manages multiple NapCat Docker instances, each bound to a QQ account.
+ * Manages multiple NapCat instances, each bound to a QQ account.
+ * Supports two modes:
+ *   - 'external': Connect to already-running NapCat instances (default)
+ *   - 'docker': Start NapCat instances as Docker containers
  */
 
 import { exec } from 'child_process';
@@ -40,6 +43,7 @@ export interface NapCatFleetConfig {
   baseHttpPort: number;
   reportHost: string;
   reportPort: number;
+  mode: 'external' | 'docker';
 }
 
 function parseAccounts(raw: string): NapCatAccountConfig[] {
@@ -61,6 +65,7 @@ export function loadFleetConfig(): NapCatFleetConfig {
     'NAPCAT_BASE_HTTP_PORT',
     'NAPCAT_REPORT_HOST',
     'NAPCAT_REPORT_PORT',
+    'NAPCAT_MODE',
   ]);
 
   const accounts = parseAccounts(
@@ -70,8 +75,9 @@ export function loadFleetConfig(): NapCatFleetConfig {
   const baseHttpPort = parseInt(process.env.NAPCAT_BASE_HTTP_PORT || env.NAPCAT_BASE_HTTP_PORT || '3001', 10);
   const reportHost = process.env.NAPCAT_REPORT_HOST || env.NAPCAT_REPORT_HOST || 'host.docker.internal';
   const reportPort = parseInt(process.env.NAPCAT_REPORT_PORT || env.NAPCAT_REPORT_PORT || '8787', 10);
+  const mode = (process.env.NAPCAT_MODE || env.NAPCAT_MODE || 'external') as 'external' | 'docker';
 
-  return { accounts, image, baseHttpPort, reportHost, reportPort };
+  return { accounts, image, baseHttpPort, reportHost, reportPort, mode };
 }
 
 export class NapCatFleetManager {
@@ -92,15 +98,18 @@ export class NapCatFleetManager {
       return;
     }
 
-    logger.info({ count: this.config.accounts.length }, 'Starting NapCat fleet');
+    logger.info({ count: this.config.accounts.length, mode: this.config.mode }, 'Starting NapCat fleet');
 
     for (let i = 0; i < this.config.accounts.length; i++) {
       const account = this.config.accounts[i];
-      const httpPort = this.config.baseHttpPort + i * 2;
-      const wsPort = httpPort + 1;
+      const httpPort = this.config.baseHttpPort + i;
 
       try {
-        await this.startInstance(account, httpPort, wsPort);
+        if (this.config.mode === 'external') {
+          await this.connectExternalInstance(account, httpPort);
+        } else {
+          await this.startDockerInstance(account, httpPort, httpPort + 1000);
+        }
       } catch (err) {
         logger.error({ qqAccount: account.qqAccount, err }, 'Failed to start NapCat instance');
       }
@@ -113,9 +122,57 @@ export class NapCatFleetManager {
   }
 
   /**
+   * Connect to an already-running NapCat instance (external mode).
+   */
+  private async connectExternalInstance(
+    account: NapCatAccountConfig,
+    httpPort: number,
+  ): Promise<void> {
+    const connector = new NapCatConnector(account.qqAccount, httpPort);
+
+    const instance: NapCatInstance = {
+      qqAccount: account.qqAccount,
+      role: account.role,
+      containerName: `external-${account.qqAccount}`,
+      httpPort,
+      wsPort: 0,
+      reportUrl: '',
+      connector,
+      status: 'starting',
+    };
+
+    this.instances.set(account.qqAccount, instance);
+
+    // Verify connectivity
+    try {
+      const alive = await connector.isAlive();
+      if (alive) {
+        instance.status = 'running';
+        const info = await connector.getLoginInfo();
+        logger.info(
+          { qqAccount: account.qqAccount, httpPort, nickname: info?.nickname },
+          'Connected to external NapCat instance',
+        );
+      } else {
+        instance.status = 'error';
+        logger.warn(
+          { qqAccount: account.qqAccount, httpPort },
+          'External NapCat instance not responding, will retry on health check',
+        );
+      }
+    } catch (err) {
+      instance.status = 'error';
+      logger.warn(
+        { qqAccount: account.qqAccount, httpPort, err },
+        'Cannot reach external NapCat instance',
+      );
+    }
+  }
+
+  /**
    * Start a single NapCat Docker instance.
    */
-  private async startInstance(
+  private async startDockerInstance(
     account: NapCatAccountConfig,
     httpPort: number,
     wsPort: number,
@@ -200,7 +257,7 @@ export class NapCatFleetManager {
   }
 
   /**
-   * Health check all instances, restart failed ones.
+   * Health check all instances.
    */
   private async healthCheck(): Promise<void> {
     for (const [qqAccount, instance] of this.instances) {
@@ -215,12 +272,14 @@ export class NapCatFleetManager {
         }
 
         if (!alive && prevStatus === 'running') {
-          logger.warn({ qqAccount }, 'NapCat instance became unhealthy, restarting');
-          try {
-            await execAsync(`docker restart ${instance.containerName}`);
-            instance.status = 'starting';
-          } catch (err) {
-            logger.error({ qqAccount, err }, 'Failed to restart NapCat instance');
+          logger.warn({ qqAccount }, 'NapCat instance became unhealthy');
+          if (this.config.mode === 'docker') {
+            try {
+              await execAsync(`docker restart ${instance.containerName}`);
+              instance.status = 'starting';
+            } catch (err) {
+              logger.error({ qqAccount, err }, 'Failed to restart NapCat instance');
+            }
           }
         }
       } catch (err) {
@@ -239,27 +298,24 @@ export class NapCatFleetManager {
       this.healthCheckInterval = null;
     }
 
-    for (const [qqAccount, instance] of this.instances) {
-      try {
-        await execAsync(`docker stop ${instance.containerName}`);
-        instance.status = 'stopped';
-        logger.info({ qqAccount }, 'NapCat instance stopped');
-      } catch (err) {
-        logger.warn({ qqAccount, err }, 'Failed to stop NapCat instance');
+    if (this.config.mode === 'docker') {
+      for (const [qqAccount, instance] of this.instances) {
+        try {
+          await execAsync(`docker stop ${instance.containerName}`);
+          instance.status = 'stopped';
+          logger.info({ qqAccount }, 'NapCat instance stopped');
+        } catch (err) {
+          logger.warn({ qqAccount, err }, 'Failed to stop NapCat instance');
+        }
       }
     }
+    // External mode: don't stop external instances, just disconnect
   }
 
-  /**
-   * Get connector for a specific QQ account.
-   */
   getConnector(qqAccount: string): NapCatConnector | undefined {
     return this.instances.get(qqAccount)?.connector;
   }
 
-  /**
-   * Get the main account's connector.
-   */
   getMainConnector(): NapCatConnector | undefined {
     for (const instance of this.instances.values()) {
       if (instance.role === 'main') return instance.connector;
@@ -267,9 +323,6 @@ export class NapCatFleetManager {
     return undefined;
   }
 
-  /**
-   * Get the main account's QQ number.
-   */
   getMainAccount(): string | undefined {
     for (const instance of this.instances.values()) {
       if (instance.role === 'main') return instance.qqAccount;
@@ -277,9 +330,6 @@ export class NapCatFleetManager {
     return undefined;
   }
 
-  /**
-   * Get all agent account QQ numbers (non-main).
-   */
   getAgentAccounts(): string[] {
     const agents: string[] = [];
     for (const instance of this.instances.values()) {
@@ -288,30 +338,18 @@ export class NapCatFleetManager {
     return agents;
   }
 
-  /**
-   * Get available (not currently assigned to a task) agent accounts.
-   */
   getAvailableAgentAccounts(assignedAccounts: Set<string>): string[] {
     return this.getAgentAccounts().filter((a) => !assignedAccounts.has(a));
   }
 
-  /**
-   * Get all instances.
-   */
   getAllInstances(): NapCatInstance[] {
     return Array.from(this.instances.values());
   }
 
-  /**
-   * Get all QQ accounts managed by the fleet (both main and agent).
-   */
   getAllBotAccounts(): Set<string> {
     return new Set(this.instances.keys());
   }
 
-  /**
-   * Check if a QQ user ID belongs to one of our bot accounts.
-   */
   isBotAccount(userId: string): boolean {
     return this.instances.has(userId);
   }
