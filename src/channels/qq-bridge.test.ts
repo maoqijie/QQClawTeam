@@ -286,16 +286,20 @@ describe('QQBridgeChannel', () => {
     const channel = new QQBridgeChannel(
       createConfig({ publicBaseUrl: 'https://bot.example.com' }),
       opts,
-      vi
-        .fn()
-        .mockResolvedValue(new Response('{}', { status: 200 })) as typeof fetch,
+      fetch,
     );
 
-    const sendPrivateMsg = vi.fn().mockResolvedValue({ retcode: 0, status: 'ok' });
-    const sendPrivateImageBase64 = vi
-      .fn()
-      .mockResolvedValue({ retcode: 0, status: 'ok' });
-    const createAgentLoginTicket = vi.fn().mockImplementation(async (options?: any) => {
+    const privateTexts: Array<{ userId: string; text: string }> = [];
+    const privateImages: Array<{ userId: string; base64: string }> = [];
+    const sendPrivateMsg = async (userId: string, text: string) => {
+      privateTexts.push({ userId, text });
+      return { retcode: 0, status: 'ok' };
+    };
+    const sendPrivateImageBase64 = async (userId: string, base64: string) => {
+      privateImages.push({ userId, base64 });
+      return { retcode: 0, status: 'ok' };
+    };
+    const createAgentLoginTicket = async (options?: any) => {
       await options?.onEvent?.({
         ticketId: 'ticket-1',
         state: 'qr_ready',
@@ -311,7 +315,7 @@ describe('QQBridgeChannel', () => {
         createdAt: '2026-03-07T23:50:00.000Z',
         expiresAt: '2026-03-08T00:10:00.000Z',
       };
-    });
+    };
 
     channel.setFleetManager({
       createAgentLoginTicket,
@@ -345,15 +349,14 @@ describe('QQBridgeChannel', () => {
     expect(body.accepted).toBe(true);
     expect(body.registered).toBe(true);
     expect(opts.onMessage).not.toHaveBeenCalled();
-    expect(sendPrivateMsg).toHaveBeenCalledTimes(1);
-    expect(sendPrivateMsg).toHaveBeenCalledWith(
-      '1000',
-      expect.stringContaining('已生成新的机器人登录二维码'),
-    );
-    expect(sendPrivateMsg.mock.calls[0]?.[1]).toContain(
+    expect(privateTexts).toHaveLength(1);
+    expect(privateTexts[0]?.userId).toBe('1000');
+    expect(privateTexts[0]?.text).toContain('已生成新的机器人登录二维码');
+    expect(privateTexts[0]?.text).toContain(
       '备用预览地址：https://bot.example.com/qq-bridge/bot-login/ticket-1',
     );
-    expect(sendPrivateImageBase64).toHaveBeenCalledTimes(1);
+    expect(privateImages).toHaveLength(1);
+    expect(privateImages[0]?.userId).toBe('1000');
 
     const qrResponse = await fetch(
       `http://127.0.0.1:${port}/qq-bridge/bot-login/ticket-1.svg`,
@@ -370,15 +373,19 @@ describe('QQBridgeChannel', () => {
     const channel = new QQBridgeChannel(
       createConfig({ publicBaseUrl: 'https://bot.example.com' }),
       opts,
-      vi
-        .fn()
-        .mockResolvedValue(new Response('{}', { status: 200 })) as typeof fetch,
+      fetch,
     );
 
-    const sendPrivateMsg = vi.fn().mockResolvedValue({ retcode: 0, status: 'ok' });
-    const sendPrivateImageBase64 = vi
-      .fn()
-      .mockResolvedValue({ retcode: 0, status: 'ok' });
+    const privateTexts: Array<{ userId: string; text: string }> = [];
+    const privateImages: Array<{ userId: string; base64: string }> = [];
+    const sendPrivateMsg = async (userId: string, text: string) => {
+      privateTexts.push({ userId, text });
+      return { retcode: 0, status: 'ok' };
+    };
+    const sendPrivateImageBase64 = async (userId: string, base64: string) => {
+      privateImages.push({ userId, base64 });
+      return { retcode: 0, status: 'ok' };
+    };
     let onEvent:
       | ((event: {
           ticketId: string;
@@ -394,7 +401,7 @@ describe('QQBridgeChannel', () => {
       | undefined;
 
     channel.setFleetManager({
-      createAgentLoginTicket: vi.fn().mockImplementation(async (options?: any) => {
+      createAgentLoginTicket: async (options?: any) => {
         onEvent = options?.onEvent;
         return {
           id: 'ticket-1',
@@ -403,7 +410,7 @@ describe('QQBridgeChannel', () => {
           createdAt: '2026-03-07T23:50:00.000Z',
           expiresAt: '2026-03-08T00:10:00.000Z',
         };
-      }),
+      },
       getMainConnector: () => ({
         sendPrivateMsg,
         sendPrivateImageBase64,
@@ -427,7 +434,8 @@ describe('QQBridgeChannel', () => {
     });
 
     expect(response.status).toBe(200);
-    expect(sendPrivateMsg).toHaveBeenCalledTimes(1);
+    expect(privateTexts).toHaveLength(1);
+    expect(privateImages).toHaveLength(1);
 
     await onEvent?.({
       ticketId: 'ticket-1',
@@ -456,16 +464,16 @@ describe('QQBridgeChannel', () => {
       nickname: 'Agent One',
     });
 
-    expect(sendPrivateMsg).toHaveBeenCalledTimes(3);
-    expect(sendPrivateMsg.mock.calls.map((call) => call[0])).toEqual([
+    expect(privateTexts).toHaveLength(3);
+    expect(privateTexts.map((item) => item.userId)).toEqual([
       '1000',
       '1000',
       '1000',
     ]);
-    expect(sendPrivateMsg.mock.calls[1]?.[1]).toContain('二维码已扫码');
-    expect(sendPrivateMsg.mock.calls[2]?.[1]).toContain('新账号已接入机器人账号池');
-    expect(sendPrivateMsg.mock.calls[2]?.[1]).toContain('QQ号：30001');
-    expect(sendPrivateMsg.mock.calls[2]?.[1]).toContain('昵称：Agent One');
+    expect(privateTexts[1]?.text).toContain('二维码已扫码');
+    expect(privateTexts[2]?.text).toContain('新账号已接入机器人账号池');
+    expect(privateTexts[2]?.text).toContain('QQ号：30001');
+    expect(privateTexts[2]?.text).toContain('昵称：Agent One');
 
     await channel.disconnect();
   });
