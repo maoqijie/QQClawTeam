@@ -6,7 +6,10 @@ import { readEnvFile } from './env.js';
 // Read config values from .env (falls back to process.env).
 // Secrets are NOT read here — they stay on disk and are loaded only
 // where needed (container-runner.ts) to avoid leaking to child processes.
-const envConfig = readEnvFile(['ASSISTANT_NAME', 'ASSISTANT_HAS_OWN_NUMBER', 'LLM_BACKEND', 'OPENAI_MODEL']);
+const envConfig = readEnvFile([
+  'ASSISTANT_NAME', 'ASSISTANT_HAS_OWN_NUMBER', 'LLM_BACKEND', 'OPENAI_MODEL',
+  'QQ_GROUP_POOL_IDS', 'DISCUSSION_MAX_ROUNDS', 'DISCUSSION_TURN_TIMEOUT',
+]);
 
 export const ASSISTANT_NAME =
   process.env.ASSISTANT_NAME || envConfig.ASSISTANT_NAME || 'Andy';
@@ -73,3 +76,18 @@ export const TRIGGER_PATTERN = new RegExp(
 // Uses system timezone by default
 export const TIMEZONE =
   process.env.TZ || Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+// QQ Group Pool: pre-created groups for team tasks
+export const QQ_GROUP_POOL_IDS: string[] = (
+  process.env.QQ_GROUP_POOL_IDS || envConfig.QQ_GROUP_POOL_IDS || ''
+).split(',').map((s) => s.trim()).filter(Boolean);
+
+// Discussion engine settings
+export const DISCUSSION_MAX_ROUNDS = parseInt(
+  process.env.DISCUSSION_MAX_ROUNDS || envConfig.DISCUSSION_MAX_ROUNDS || '5',
+  10,
+);
+export const DISCUSSION_TURN_TIMEOUT = parseInt(
+  process.env.DISCUSSION_TURN_TIMEOUT || envConfig.DISCUSSION_TURN_TIMEOUT || '120000',
+  10,
+);

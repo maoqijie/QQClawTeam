@@ -333,6 +333,82 @@ Use available_groups.json to find the JID for a group. The folder name must be c
   },
 );
 
+// --- Team Task MCP Tools (main group only) ---
+
+server.tool(
+  'create_team_task',
+  `Create a multi-agent collaborative task. Only available to the main agent.
+The task will be assigned to available agent accounts, a discussion group will be allocated from the pool, and agents will discuss in turns.
+
+ROLES: Each role represents an agent perspective. Provide 2-4 roles with distinct viewpoints.
+Example roles: ["架构师", "测试工程师", "安全专家"]`,
+  {
+    description: z.string().describe('Task description - what needs to be discussed/solved'),
+    title: z.string().optional().describe('Short title for the task'),
+    user_id: z.string().describe('The user ID who requested this task'),
+    user_chat_jid: z.string().describe('The chat JID to send results back to'),
+    roles: z.array(z.object({
+      roleName: z.string().describe('Role name (e.g. "架构师")'),
+      description: z.string().describe('Role description and perspective'),
+      systemPrompt: z.string().optional().describe('Custom system prompt for this role'),
+    })).min(2).max(6).describe('Agent roles for the discussion'),
+  },
+  async (args) => {
+    if (!isMain) {
+      return {
+        content: [{ type: 'text' as const, text: 'Only the main agent can create team tasks.' }],
+        isError: true,
+      };
+    }
+
+    const data = {
+      type: 'create_team_task',
+      userId: args.user_id,
+      userChatJid: args.user_chat_jid,
+      description: args.description,
+      title: args.title,
+      roles: args.roles,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(TASKS_DIR, data);
+
+    return {
+      content: [{ type: 'text' as const, text: `Team task creation requested. Roles: ${args.roles.map(r => r.roleName).join(', ')}` }],
+    };
+  },
+);
+
+server.tool(
+  'end_team_discussion',
+  'End an ongoing team discussion and compile the result. Only available to the main agent.',
+  {
+    task_id: z.string().describe('The team task ID'),
+    result: z.string().optional().describe('Optional synthesis/result to record'),
+  },
+  async (args) => {
+    if (!isMain) {
+      return {
+        content: [{ type: 'text' as const, text: 'Only the main agent can end team discussions.' }],
+        isError: true,
+      };
+    }
+
+    const data = {
+      type: 'end_discussion',
+      taskId: args.task_id,
+      result: args.result,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(TASKS_DIR, data);
+
+    return {
+      content: [{ type: 'text' as const, text: `Discussion end requested for task ${args.task_id}.` }],
+    };
+  },
+);
+
 // Start the stdio transport
 const transport = new StdioServerTransport();
 await server.connect(transport);

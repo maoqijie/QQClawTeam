@@ -9,6 +9,7 @@ import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
 import { RegisteredGroup } from './types.js';
+import { processTeamTaskIpc, type TeamTaskIpcDeps } from './team-task-ipc.js';
 
 export interface IpcDeps {
   sendMessage: (jid: string, text: string) => Promise<void>;
@@ -22,6 +23,7 @@ export interface IpcDeps {
     availableGroups: AvailableGroup[],
     registeredJids: Set<string>,
   ) => void;
+  teamTaskDeps?: TeamTaskIpcDeps;
 }
 
 let ipcWatcherRunning = false;
@@ -446,6 +448,17 @@ export async function processTaskIpc(
           { data },
           'Invalid register_group request - missing required fields',
         );
+      }
+      break;
+
+    case 'create_team_task':
+    case 'start_discussion':
+    case 'end_discussion':
+    case 'get_team_task_status':
+      if (deps.teamTaskDeps) {
+        await processTeamTaskIpc(data as Parameters<typeof processTeamTaskIpc>[0], sourceGroup, isMain, deps.teamTaskDeps);
+      } else {
+        logger.warn({ type: data.type }, 'Team task IPC received but teamTaskDeps not configured');
       }
       break;
 

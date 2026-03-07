@@ -10,6 +10,15 @@ import { setRegisteredGroup } from '../db.js';
 import { readEnvFile } from '../env.js';
 import { resolveGroupFolderPath } from '../group-folder.js';
 import { logger } from '../logger.js';
+import { NapCatFleetManager } from '../napcat-fleet.js';
+import {
+  isMessageEvent,
+  isMetaEvent,
+  parseMessageEvent,
+  isBotMessage,
+  mentionsBot,
+  type OneBotMessageEvent,
+} from '../onebot-parser.js';
 import { Channel, RegisteredGroup } from '../types.js';
 import { ChannelOpts, registerChannel } from './registry.js';
 
@@ -458,6 +467,11 @@ export class QQBridgeChannel implements Channel {
   private server: http.Server | null = null;
   private boundPort: number | null = null;
   private readonly dispatcher: OutboundDispatcher;
+  private fleetManager: NapCatFleetManager | null = null;
+  /** Sliding window of recently seen message IDs for dedup (OneBot multi-bot scenario). */
+  private recentMessageIds = new Set<string>();
+  private messageIdOrder: string[] = [];
+  private static readonly DEDUP_WINDOW = 1000;
 
   constructor(
     private readonly config: QQBridgeConfig,
@@ -465,6 +479,45 @@ export class QQBridgeChannel implements Channel {
     fetchFn?: FetchFn,
   ) {
     this.dispatcher = new OutboundDispatcher(config, fetchFn);
+  }
+
+  /**
+   * Attach fleet manager for multi-account sending.
+   */
+  setFleetManager(manager: NapCatFleetManager): void {
+    this.fleetManager = manager;
+  }
+
+  /**
+   * Send a message as a specific QQ account via the fleet manager.
+   * Falls back to the default outbound dispatcher if fleet is not available.
+   */
+  async sendAsAccount(groupId: string, qqAccount: string, text: string): Promise<void> {
+    if (!this.fleetManager) {
+      // Fallback to default outbound
+      const jid = toQqJid('group', groupId);
+      return this.sendMessage(jid, text);
+    }
+
+    const connector = this.fleetManager.getConnector(qqAccount);
+    if (!connector) {
+      logger.warn({ qqAccount, groupId }, 'No connector for QQ account, falling back to default');
+      const jid = toQqJid('group', groupId);
+      return this.sendMessage(jid, text);
+    }
+
+    await connector.sendGroupMsg(groupId, text);
+  }
+
+  private isDuplicate(messageId: string): boolean {
+    if (this.recentMessageIds.has(messageId)) return true;
+    this.recentMessageIds.add(messageId);
+    this.messageIdOrder.push(messageId);
+    while (this.messageIdOrder.length > QQBridgeChannel.DEDUP_WINDOW) {
+      const old = this.messageIdOrder.shift()!;
+      this.recentMessageIds.delete(old);
+    }
+    return false;
   }
 
   async connect(): Promise<void> {
@@ -542,6 +595,16 @@ export class QQBridgeChannel implements Channel {
 
       if (request.url === '/qq-bridge/inbound' && request.method === 'POST') {
         const rawBody = await readJsonBody(request);
+        const raw = rawBody as Record<string, unknown>;
+
+        // Detect raw OneBot v11 events (NapCat direct reporting)
+        if (raw.post_type) {
+          const onebotResult = this.acceptOneBotEvent(raw);
+          jsonResponse(response, 200, onebotResult);
+          return;
+        }
+
+        // Normalized format (external bridge)
         const payload = inboundPayloadSchema.parse(rawBody);
         const result = this.acceptInbound(payload);
         jsonResponse(response, 200, {
@@ -602,6 +665,100 @@ export class QQBridgeChannel implements Channel {
         error: error instanceof Error ? error.message : 'invalid_request',
       });
     }
+  }
+
+  /**
+   * Handle raw OneBot v11 events from NapCat HTTP reporting.
+   * Bot messages are NOT stored into the main messages table to prevent feedback loops.
+   * Only processes messages from the main bot account to avoid duplicates.
+   */
+  private acceptOneBotEvent(raw: Record<string, unknown>): Record<string, unknown> {
+    // Ignore meta events (heartbeat, lifecycle)
+    if (isMetaEvent(raw)) {
+      return { ok: true, action: 'ignored', reason: 'meta_event' };
+    }
+
+    // Only handle message events
+    if (!isMessageEvent(raw)) {
+      return { ok: true, action: 'ignored', reason: 'not_message' };
+    }
+
+    const event = raw as unknown as OneBotMessageEvent;
+    const parsed = parseMessageEvent(event);
+    const botAccounts = this.fleetManager?.getAllBotAccounts() ?? new Set<string>();
+    const mainAccount = this.fleetManager?.getMainAccount();
+
+    // Dedup: Only process from main bot instance to avoid N copies of each message
+    if (mainAccount && parsed.selfId !== mainAccount) {
+      return { ok: true, action: 'ignored', reason: 'non_main_receiver' };
+    }
+
+    // Message dedup by message_id
+    if (this.isDuplicate(parsed.messageId)) {
+      return { ok: true, action: 'ignored', reason: 'duplicate' };
+    }
+
+    // If message is from a bot account, do NOT store in main messages table
+    if (isBotMessage(event, botAccounts)) {
+      return { ok: true, action: 'ignored', reason: 'bot_message' };
+    }
+
+    // Convert to normalized format and process
+    const chatType = parsed.messageType;
+    const chatId = chatType === 'group' ? parsed.groupId! : parsed.userId;
+    const chatJid = toQqJid(chatType, chatId);
+    const chatName = chatType === 'group' ? `QQ群 ${chatId}` : parsed.nickname;
+
+    // Check if bot is mentioned (for trigger)
+    const botMentioned = mentionsBot(event, botAccounts);
+
+    this.opts.onChatMetadata(
+      chatJid,
+      parsed.timestamp,
+      chatName,
+      'qq',
+      chatType === 'group',
+    );
+
+    const isRegistered = Boolean(this.opts.registeredGroups()[chatJid]);
+    const shouldAutoRegister =
+      chatType === 'private'
+        ? this.config.autoRegisterPrivate
+        : this.config.autoRegisterGroups;
+
+    let registered = isRegistered;
+    if (!registered && shouldAutoRegister) {
+      this.ensureRegisteredGroup(chatType, chatId, chatName);
+      registered = true;
+    }
+
+    const shouldStoreMessage =
+      registered ||
+      chatType === 'private' ||
+      this.config.storeUnregisteredGroupMessages;
+
+    if (!shouldStoreMessage) {
+      return { ok: true, action: 'skipped', reason: 'not_registered' };
+    }
+
+    // Build content with trigger if mentioned
+    let content = parsed.content;
+    if (chatType === 'group' && botMentioned) {
+      content = defaultTriggerText(content);
+    }
+
+    this.opts.onMessage(chatJid, {
+      id: parsed.messageId,
+      chat_jid: chatJid,
+      sender: parsed.userId,
+      sender_name: parsed.nickname,
+      content,
+      timestamp: parsed.timestamp,
+      is_from_me: false,
+      is_bot_message: false,
+    });
+
+    return { ok: true, action: 'accepted', chatJid };
   }
 
   private acceptInbound(payload: z.infer<typeof inboundPayloadSchema>): {

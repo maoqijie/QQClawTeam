@@ -41,6 +41,7 @@ export interface ContainerInput {
   secrets?: Record<string, string>;
   llmBackend?: string;  // 'claude' | 'openai'
   llmModel?: string;    // e.g. 'gpt-4o', 'deepseek-chat'
+  teamTaskId?: string;  // For team workspace mount
 }
 
 export interface ContainerOutput {
@@ -213,6 +214,29 @@ function buildVolumeMounts(
 }
 
 /**
+ * Build volume mounts with optional team workspace for collaborative tasks.
+ */
+function buildVolumeMountsWithTeam(
+  group: RegisteredGroup,
+  isMain: boolean,
+  teamTaskId?: string,
+): VolumeMount[] {
+  const mounts = buildVolumeMounts(group, isMain);
+
+  if (teamTaskId) {
+    const teamWorkspaceDir = path.join(DATA_DIR, 'team-workspaces', teamTaskId);
+    fs.mkdirSync(teamWorkspaceDir, { recursive: true });
+    mounts.push({
+      hostPath: teamWorkspaceDir,
+      containerPath: '/workspace/team',
+      readonly: false,
+    });
+  }
+
+  return mounts;
+}
+
+/**
  * Read allowed secrets from .env for passing to the container via stdin.
  * Secrets are never written to disk or mounted as files.
  */
@@ -270,7 +294,7 @@ export async function runContainerAgent(
   const groupDir = resolveGroupFolderPath(group.folder);
   fs.mkdirSync(groupDir, { recursive: true });
 
-  const mounts = buildVolumeMounts(group, input.isMain);
+  const mounts = buildVolumeMountsWithTeam(group, input.isMain, input.teamTaskId);
   const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
   const containerName = `nanoclaw-${safeName}-${Date.now()}`;
   const containerArgs = buildContainerArgs(mounts, containerName);

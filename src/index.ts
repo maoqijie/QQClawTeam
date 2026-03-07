@@ -40,6 +40,25 @@ import {
   setSession,
   storeChatMetadata,
   storeMessage,
+  // Team collaboration DB functions
+  createTeamTask as dbCreateTeamTask,
+  getTeamTask as dbGetTeamTask,
+  updateTeamTask as dbUpdateTeamTask,
+  getActiveTaskForUser as dbGetActiveTaskForUser,
+  getAllActiveTasks as dbGetAllActiveTasks,
+  createAgentAssignment as dbCreateAgentAssignment,
+  getAssignmentsForTask as dbGetAssignmentsForTask,
+  updateAgentAssignment as dbUpdateAgentAssignment,
+  getGroupPool as dbGetGroupPool,
+  getAllGroupPool as dbGetAllGroupPool,
+  upsertGroupPool as dbUpsertGroupPool,
+  updateGroupPoolStatus as dbUpdateGroupPoolStatus,
+  createDiscussion as dbCreateDiscussion,
+  getDiscussion as dbGetDiscussion,
+  updateDiscussion as dbUpdateDiscussion,
+  addDiscussionMessage as dbAddDiscussionMessage,
+  getDiscussionMessages as dbGetDiscussionMessages,
+  getDiscussionByGroup as dbGetDiscussionByGroup,
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
@@ -54,6 +73,11 @@ import {
 import { startSchedulerLoop } from './task-scheduler.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
+import { NapCatFleetManager, loadFleetConfig } from './napcat-fleet.js';
+import { GroupPoolManager } from './group-pool.js';
+import { TeamTaskManager } from './team-task.js';
+import { DiscussionEngine } from './discussion-engine.js';
+import { QQBridgeChannel } from './channels/qq-bridge.js';
 
 // Re-export for backwards compatibility during refactor
 export { escapeXml, formatMessages } from './router.js';
@@ -474,10 +498,12 @@ async function main(): Promise<void> {
   logger.info('Database initialized');
   loadState();
 
-  // Graceful shutdown handlers
+  // Graceful shutdown handlers (fleetManager captured in closure after init)
+  let _fleetManagerRef: NapCatFleetManager | null = null;
   const shutdown = async (signal: string) => {
     logger.info({ signal }, 'Shutdown signal received');
     await queue.shutdown(10000);
+    if (_fleetManagerRef) await _fleetManagerRef.stopAll();
     for (const ch of channels) await ch.disconnect();
     process.exit(0);
   };
@@ -536,6 +562,131 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
+  // --- Initialize Team Collaboration Modules ---
+  const fleetConfig = loadFleetConfig();
+  let fleetManager: NapCatFleetManager | null = null;
+  let groupPool: GroupPoolManager | null = null;
+  let taskManager: TeamTaskManager | null = null;
+  let discussionEngine: DiscussionEngine | null = null;
+
+  if (fleetConfig.accounts.length > 0) {
+    fleetManager = new NapCatFleetManager(fleetConfig);
+
+    // Attach fleet manager to QQ bridge channel if present
+    for (const ch of channels) {
+      if (ch instanceof QQBridgeChannel) {
+        ch.setFleetManager(fleetManager);
+      }
+    }
+
+    // Start fleet
+    await fleetManager.startAll();
+
+    // Initialize group pool
+    groupPool = new GroupPoolManager(
+      {
+        getGroupPool: dbGetGroupPool,
+        getAllGroupPool: dbGetAllGroupPool,
+        upsertGroupPool: dbUpsertGroupPool,
+        updateGroupPoolStatus: dbUpdateGroupPoolStatus,
+      },
+      fleetManager,
+    );
+    await groupPool.syncGroupPool();
+
+    // Initialize task manager
+    taskManager = new TeamTaskManager(
+      {
+        createTeamTask: dbCreateTeamTask,
+        getTeamTask: dbGetTeamTask,
+        updateTeamTask: dbUpdateTeamTask,
+        getActiveTaskForUser: dbGetActiveTaskForUser,
+        getAllActiveTasks: dbGetAllActiveTasks,
+        createAgentAssignment: dbCreateAgentAssignment,
+        getAssignmentsForTask: dbGetAssignmentsForTask,
+        updateAgentAssignment: dbUpdateAgentAssignment,
+      },
+      (assigned) => fleetManager!.getAvailableAgentAccounts(assigned),
+    );
+
+    // Initialize discussion engine
+    const qqBridge = channels.find((ch) => ch instanceof QQBridgeChannel) as QQBridgeChannel | undefined;
+
+    discussionEngine = new DiscussionEngine({
+      db: {
+        createDiscussion: dbCreateDiscussion,
+        getDiscussion: dbGetDiscussion,
+        updateDiscussion: dbUpdateDiscussion,
+        addDiscussionMessage: dbAddDiscussionMessage,
+        getDiscussionMessages: dbGetDiscussionMessages,
+        getDiscussionByGroup: dbGetDiscussionByGroup,
+      },
+      sendAsAccount: async (groupId, qqAccount, text) => {
+        if (qqBridge) {
+          await qqBridge.sendAsAccount(groupId, qqAccount, text);
+        }
+      },
+      runAgentTurn: async (participant, taskDescription, history, round) => {
+        // Build a prompt for the agent's turn
+        const prompt = [
+          `你是一个团队讨论中的 ${participant.roleName}。`,
+          participant.systemPrompt ? `角色描述: ${participant.systemPrompt}` : '',
+          '',
+          `任务: ${taskDescription}`,
+          '',
+          `当前是第 ${round} 轮讨论。`,
+          '',
+          '讨论历史:',
+          history,
+          '',
+          '请基于以上讨论，从你的角色视角发表你的观点和建议。保持简洁有力，200字以内。',
+        ].filter(Boolean).join('\n');
+
+        // For now, return a placeholder - in production this would spawn a container
+        // The actual agent container spawning will be done through the existing runContainerAgent
+        return `[${participant.roleName}] 正在思考中...（讨论引擎已就绪，需要配置Agent容器启动）`;
+      },
+      getTaskDescription: (taskId) => {
+        const task = dbGetTeamTask(taskId);
+        return task ? task.description : '(任务未找到)';
+      },
+      sendToUser: async (taskId, text) => {
+        const task = dbGetTeamTask(taskId);
+        if (task) {
+          const channel = findChannel(channels, task.userChatJid);
+          if (channel) await channel.sendMessage(task.userChatJid, text);
+        }
+      },
+      onDiscussionComplete: async (taskId, result) => {
+        const task = dbGetTeamTask(taskId);
+        if (!task) return;
+
+        taskManager!.completeTask(taskId, result);
+
+        // Release group back to pool
+        if (task.qqGroupId && groupPool) {
+          groupPool.releaseGroup(task.qqGroupId);
+        }
+
+        // Send result to user
+        const channel = findChannel(channels, task.userChatJid);
+        if (channel) {
+          await channel.sendMessage(
+            task.userChatJid,
+            `📋 团队任务完成\n\n${result}`,
+          );
+        }
+      },
+    });
+
+    _fleetManagerRef = fleetManager;
+
+    logger.info({
+      accounts: fleetConfig.accounts.length,
+      poolSize: groupPool.getAvailableCount(),
+    }, 'Team collaboration modules initialized');
+  }
+
   // Start subsystems (independently of connection handler)
   startSchedulerLoop({
     registeredGroups: () => registeredGroups,
@@ -553,12 +704,14 @@ async function main(): Promise<void> {
       if (text) await channel.sendMessage(jid, text);
     },
   });
+  const ipcSendMessage = (jid: string, text: string) => {
+    const channel = findChannel(channels, jid);
+    if (!channel) throw new Error(`No channel for JID: ${jid}`);
+    return channel.sendMessage(jid, text);
+  };
+
   startIpcWatcher({
-    sendMessage: (jid, text) => {
-      const channel = findChannel(channels, jid);
-      if (!channel) throw new Error(`No channel for JID: ${jid}`);
-      return channel.sendMessage(jid, text);
-    },
+    sendMessage: ipcSendMessage,
     registeredGroups: () => registeredGroups,
     registerGroup,
     syncGroups: async (force: boolean) => {
@@ -571,6 +724,12 @@ async function main(): Promise<void> {
     getAvailableGroups,
     writeGroupsSnapshot: (gf, im, ag, rj) =>
       writeGroupsSnapshot(gf, im, ag, rj),
+    teamTaskDeps: taskManager && groupPool && discussionEngine ? {
+      taskManager,
+      groupPool,
+      discussionEngine,
+      sendMessage: ipcSendMessage,
+    } : undefined,
   });
   queue.setProcessMessagesFn(processGroupMessages);
   recoverPendingMessages();

@@ -11,6 +11,9 @@ import {
   ScheduledTask,
   TaskRunLog,
 } from './types.js';
+import type { GroupPoolEntry } from './group-pool.js';
+import type { TeamTask, AgentAssignment } from './team-task.js';
+import type { DiscussionState, DiscussionMessage, DiscussionParticipant } from './discussion-engine.js';
 
 let db: Database.Database;
 
@@ -139,6 +142,76 @@ function createSchema(database: Database.Database): void {
   } catch {
     /* columns already exist */
   }
+
+  // --- Team collaboration tables ---
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS team_tasks (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      user_chat_jid TEXT NOT NULL,
+      title TEXT,
+      description TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      qq_group_id TEXT,
+      discussion_id TEXT,
+      agent_roles TEXT,
+      result TEXT,
+      priority INTEGER DEFAULT 0,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      completed_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_team_tasks_user ON team_tasks(user_id, status);
+    CREATE INDEX IF NOT EXISTS idx_team_tasks_status ON team_tasks(status);
+
+    CREATE TABLE IF NOT EXISTS agent_assignments (
+      id TEXT PRIMARY KEY,
+      task_id TEXT NOT NULL,
+      qq_account TEXT NOT NULL,
+      role_name TEXT NOT NULL,
+      status TEXT DEFAULT 'assigned',
+      FOREIGN KEY (task_id) REFERENCES team_tasks(id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_agent_assignments_task ON agent_assignments(task_id);
+
+    CREATE TABLE IF NOT EXISTS group_pool (
+      qq_group_id TEXT PRIMARY KEY,
+      status TEXT DEFAULT 'available',
+      current_task_id TEXT,
+      member_accounts TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS discussions (
+      id TEXT PRIMARY KEY,
+      task_id TEXT NOT NULL,
+      qq_group_id TEXT NOT NULL,
+      phase TEXT DEFAULT 'idle',
+      current_round INTEGER DEFAULT 0,
+      max_rounds INTEGER DEFAULT 5,
+      turn_order TEXT,
+      current_turn_index INTEGER DEFAULT 0,
+      participants TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_discussions_task ON discussions(task_id);
+    CREATE INDEX IF NOT EXISTS idx_discussions_group ON discussions(qq_group_id);
+
+    CREATE TABLE IF NOT EXISTS discussion_messages (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      discussion_id TEXT NOT NULL,
+      round INTEGER NOT NULL,
+      sender_account TEXT NOT NULL,
+      sender_role TEXT NOT NULL,
+      content TEXT NOT NULL,
+      message_type TEXT DEFAULT 'contribution',
+      timestamp TEXT NOT NULL,
+      FOREIGN KEY (discussion_id) REFERENCES discussions(id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_disc_msgs ON discussion_messages(discussion_id, round);
+  `);
 }
 
 export function initDatabase(): void {
@@ -632,6 +705,254 @@ export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
     };
   }
   return result;
+}
+
+// --- Team Task accessors ---
+
+export function createTeamTask(task: TeamTask): void {
+  db.prepare(
+    `INSERT INTO team_tasks (id, user_id, user_chat_jid, title, description, status, qq_group_id, discussion_id, agent_roles, result, priority, created_at, updated_at, completed_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    task.id,
+    task.userId,
+    task.userChatJid,
+    task.title,
+    task.description,
+    task.status,
+    task.qqGroupId,
+    task.discussionId,
+    JSON.stringify(task.agentRoles),
+    task.result,
+    task.priority,
+    task.createdAt,
+    task.updatedAt,
+    task.completedAt,
+  );
+}
+
+export function getTeamTask(id: string): TeamTask | undefined {
+  const row = db.prepare('SELECT * FROM team_tasks WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+  if (!row) return undefined;
+  return {
+    id: row.id as string,
+    userId: row.user_id as string,
+    userChatJid: row.user_chat_jid as string,
+    title: row.title as string | null,
+    description: row.description as string,
+    status: row.status as TeamTask['status'],
+    qqGroupId: row.qq_group_id as string | null,
+    discussionId: row.discussion_id as string | null,
+    agentRoles: row.agent_roles ? JSON.parse(row.agent_roles as string) : [],
+    result: row.result as string | null,
+    priority: row.priority as number,
+    createdAt: row.created_at as string,
+    updatedAt: row.updated_at as string,
+    completedAt: row.completed_at as string | null,
+  };
+}
+
+export function updateTeamTask(id: string, updates: Partial<TeamTask>): void {
+  const fields: string[] = [];
+  const values: unknown[] = [];
+
+  const fieldMap: Record<string, string> = {
+    title: 'title',
+    description: 'description',
+    status: 'status',
+    qqGroupId: 'qq_group_id',
+    discussionId: 'discussion_id',
+    result: 'result',
+    priority: 'priority',
+    updatedAt: 'updated_at',
+    completedAt: 'completed_at',
+  };
+
+  for (const [key, col] of Object.entries(fieldMap)) {
+    const val = (updates as Record<string, unknown>)[key];
+    if (val !== undefined) {
+      fields.push(`${col} = ?`);
+      values.push(val);
+    }
+  }
+
+  if (updates.agentRoles !== undefined) {
+    fields.push('agent_roles = ?');
+    values.push(JSON.stringify(updates.agentRoles));
+  }
+
+  if (fields.length === 0) return;
+  values.push(id);
+  db.prepare(`UPDATE team_tasks SET ${fields.join(', ')} WHERE id = ?`).run(...values);
+}
+
+export function getActiveTaskForUser(userId: string): TeamTask | undefined {
+  const row = db.prepare(
+    `SELECT * FROM team_tasks WHERE user_id = ? AND status IN ('pending', 'planning', 'in_progress') ORDER BY created_at DESC LIMIT 1`,
+  ).get(userId) as Record<string, unknown> | undefined;
+  if (!row) return undefined;
+  return getTeamTask(row.id as string);
+}
+
+export function getAllActiveTasks(): TeamTask[] {
+  const rows = db.prepare(
+    `SELECT id FROM team_tasks WHERE status IN ('pending', 'planning', 'in_progress') ORDER BY created_at`,
+  ).all() as Array<{ id: string }>;
+  return rows.map((r) => getTeamTask(r.id)!).filter(Boolean);
+}
+
+export function createAgentAssignment(assignment: AgentAssignment): void {
+  db.prepare(
+    `INSERT INTO agent_assignments (id, task_id, qq_account, role_name, status) VALUES (?, ?, ?, ?, ?)`,
+  ).run(assignment.id, assignment.taskId, assignment.qqAccount, assignment.roleName, assignment.status);
+}
+
+export function getAssignmentsForTask(taskId: string): AgentAssignment[] {
+  return db.prepare('SELECT * FROM agent_assignments WHERE task_id = ?').all(taskId) as Array<{
+    id: string; task_id: string; qq_account: string; role_name: string; status: string;
+  }> as unknown as AgentAssignment[];
+}
+
+export function updateAgentAssignment(id: string, updates: Partial<AgentAssignment>): void {
+  if (updates.status !== undefined) {
+    db.prepare('UPDATE agent_assignments SET status = ? WHERE id = ?').run(updates.status, id);
+  }
+}
+
+// --- Group Pool accessors ---
+
+export function getGroupPool(groupId: string): GroupPoolEntry | undefined {
+  const row = db.prepare('SELECT * FROM group_pool WHERE qq_group_id = ?').get(groupId) as Record<string, unknown> | undefined;
+  if (!row) return undefined;
+  return {
+    qqGroupId: row.qq_group_id as string,
+    status: row.status as GroupPoolEntry['status'],
+    currentTaskId: row.current_task_id as string | null,
+    memberAccounts: row.member_accounts ? JSON.parse(row.member_accounts as string) : [],
+    createdAt: row.created_at as string,
+    updatedAt: row.updated_at as string,
+  };
+}
+
+export function getAllGroupPool(): GroupPoolEntry[] {
+  const rows = db.prepare('SELECT * FROM group_pool').all() as Array<Record<string, unknown>>;
+  return rows.map((row) => ({
+    qqGroupId: row.qq_group_id as string,
+    status: row.status as GroupPoolEntry['status'],
+    currentTaskId: row.current_task_id as string | null,
+    memberAccounts: row.member_accounts ? JSON.parse(row.member_accounts as string) : [],
+    createdAt: row.created_at as string,
+    updatedAt: row.updated_at as string,
+  }));
+}
+
+export function upsertGroupPool(entry: GroupPoolEntry): void {
+  db.prepare(
+    `INSERT OR REPLACE INTO group_pool (qq_group_id, status, current_task_id, member_accounts, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+  ).run(
+    entry.qqGroupId,
+    entry.status,
+    entry.currentTaskId,
+    JSON.stringify(entry.memberAccounts),
+    entry.createdAt,
+    entry.updatedAt,
+  );
+}
+
+export function updateGroupPoolStatus(groupId: string, status: GroupPoolEntry['status'], taskId: string | null): void {
+  db.prepare(
+    `UPDATE group_pool SET status = ?, current_task_id = ?, updated_at = ? WHERE qq_group_id = ?`,
+  ).run(status, taskId, new Date().toISOString(), groupId);
+}
+
+// --- Discussion accessors ---
+
+export function createDiscussion(state: DiscussionState): void {
+  db.prepare(
+    `INSERT INTO discussions (id, task_id, qq_group_id, phase, current_round, max_rounds, turn_order, current_turn_index, participants, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    state.id,
+    state.taskId,
+    state.qqGroupId,
+    state.phase,
+    state.currentRound,
+    state.maxRounds,
+    JSON.stringify(state.turnOrder),
+    state.currentTurnIndex,
+    JSON.stringify(state.participants),
+    state.createdAt,
+    state.updatedAt,
+  );
+}
+
+export function getDiscussion(id: string): DiscussionState | undefined {
+  const row = db.prepare('SELECT * FROM discussions WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+  if (!row) return undefined;
+  return {
+    id: row.id as string,
+    taskId: row.task_id as string,
+    qqGroupId: row.qq_group_id as string,
+    phase: row.phase as DiscussionState['phase'],
+    currentRound: row.current_round as number,
+    maxRounds: row.max_rounds as number,
+    turnOrder: JSON.parse(row.turn_order as string),
+    currentTurnIndex: row.current_turn_index as number,
+    participants: JSON.parse(row.participants as string) as DiscussionParticipant[],
+    createdAt: row.created_at as string,
+    updatedAt: row.updated_at as string,
+  };
+}
+
+export function updateDiscussion(id: string, updates: Partial<DiscussionState>): void {
+  const fields: string[] = [];
+  const values: unknown[] = [];
+
+  if (updates.phase !== undefined) { fields.push('phase = ?'); values.push(updates.phase); }
+  if (updates.currentRound !== undefined) { fields.push('current_round = ?'); values.push(updates.currentRound); }
+  if (updates.currentTurnIndex !== undefined) { fields.push('current_turn_index = ?'); values.push(updates.currentTurnIndex); }
+  if (updates.updatedAt !== undefined) { fields.push('updated_at = ?'); values.push(updates.updatedAt); }
+
+  if (fields.length === 0) return;
+  values.push(id);
+  db.prepare(`UPDATE discussions SET ${fields.join(', ')} WHERE id = ?`).run(...values);
+}
+
+export function addDiscussionMessage(msg: DiscussionMessage): void {
+  db.prepare(
+    `INSERT INTO discussion_messages (discussion_id, round, sender_account, sender_role, content, message_type, timestamp)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).run(msg.discussionId, msg.round, msg.senderAccount, msg.senderRole, msg.content, msg.messageType, msg.timestamp);
+}
+
+export function getDiscussionMessages(discussionId: string, round?: number): DiscussionMessage[] {
+  if (round !== undefined) {
+    return db.prepare(
+      'SELECT * FROM discussion_messages WHERE discussion_id = ? AND round = ? ORDER BY id',
+    ).all(discussionId, round) as Array<Record<string, unknown>> as unknown as DiscussionMessage[];
+  }
+  const rows = db.prepare(
+    'SELECT * FROM discussion_messages WHERE discussion_id = ? ORDER BY id',
+  ).all(discussionId) as Array<Record<string, unknown>>;
+  return rows.map((row) => ({
+    id: row.id as number,
+    discussionId: row.discussion_id as string,
+    round: row.round as number,
+    senderAccount: row.sender_account as string,
+    senderRole: row.sender_role as string,
+    content: row.content as string,
+    messageType: row.message_type as DiscussionMessage['messageType'],
+    timestamp: row.timestamp as string,
+  }));
+}
+
+export function getDiscussionByGroup(qqGroupId: string): DiscussionState | undefined {
+  const row = db.prepare(
+    `SELECT id FROM discussions WHERE qq_group_id = ? AND phase != 'completed' ORDER BY created_at DESC LIMIT 1`,
+  ).get(qqGroupId) as { id: string } | undefined;
+  if (!row) return undefined;
+  return getDiscussion(row.id);
 }
 
 // --- JSON migration ---
