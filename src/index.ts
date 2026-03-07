@@ -4,6 +4,8 @@ import path from 'path';
 import {
   ASSISTANT_NAME,
   IDLE_TIMEOUT,
+  LLM_BACKEND,
+  OPENAI_MODEL,
   POLL_INTERVAL,
   TIMEZONE,
   TRIGGER_PATTERN,
@@ -302,16 +304,20 @@ async function runAgent(
       }
     : undefined;
 
+  const effectiveBackend = group.containerConfig?.llmBackend || LLM_BACKEND;
+
   try {
     const output = await runContainerAgent(
       group,
       {
         prompt,
-        sessionId,
+        sessionId: effectiveBackend === 'claude' ? sessionId : undefined,
         groupFolder: group.folder,
         chatJid,
         isMain,
         assistantName: ASSISTANT_NAME,
+        llmBackend: effectiveBackend,
+        llmModel: OPENAI_MODEL,
       },
       (proc, containerName) =>
         queue.registerProcess(chatJid, proc, containerName, group.folder),

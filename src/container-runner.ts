@@ -39,6 +39,8 @@ export interface ContainerInput {
   isScheduledTask?: boolean;
   assistantName?: string;
   secrets?: Record<string, string>;
+  llmBackend?: string;  // 'claude' | 'openai'
+  llmModel?: string;    // e.g. 'gpt-4o', 'deepseek-chat'
 }
 
 export interface ContainerOutput {
@@ -220,6 +222,8 @@ function readSecrets(): Record<string, string> {
     'ANTHROPIC_API_KEY',
     'ANTHROPIC_BASE_URL',
     'ANTHROPIC_AUTH_TOKEN',
+    'OPENAI_API_KEY',
+    'OPENAI_BASE_URL',
   ]);
 }
 

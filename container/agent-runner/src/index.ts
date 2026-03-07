@@ -28,6 +28,8 @@ interface ContainerInput {
   isScheduledTask?: boolean;
   assistantName?: string;
   secrets?: Record<string, string>;
+  llmBackend?: string;  // 'claude' | 'openai'
+  llmModel?: string;    // e.g. 'gpt-4o', 'deepseek-chat'
 }
 
 interface ContainerOutput {
@@ -490,24 +492,7 @@ async function runQuery(
   return { newSessionId, lastAssistantUuid, closedDuringQuery };
 }
 
-async function main(): Promise<void> {
-  let containerInput: ContainerInput;
-
-  try {
-    const stdinData = await readStdin();
-    containerInput = JSON.parse(stdinData);
-    // Delete the temp file the entrypoint wrote — it contains secrets
-    try { fs.unlinkSync('/tmp/input.json'); } catch { /* may not exist */ }
-    log(`Received input for group: ${containerInput.groupFolder}`);
-  } catch (err) {
-    writeOutput({
-      status: 'error',
-      result: null,
-      error: `Failed to parse input: ${err instanceof Error ? err.message : String(err)}`
-    });
-    process.exit(1);
-  }
-
+async function runClaudeBackend(containerInput: ContainerInput): Promise<void> {
   // Build SDK env: merge secrets into process.env for the SDK only.
   // Secrets never touch process.env itself, so Bash subprocesses can't see them.
   const sdkEnv: Record<string, string | undefined> = { ...process.env };
@@ -582,6 +567,35 @@ async function main(): Promise<void> {
       error: errorMessage
     });
     process.exit(1);
+  }
+}
+
+async function main(): Promise<void> {
+  let containerInput: ContainerInput;
+
+  try {
+    const stdinData = await readStdin();
+    containerInput = JSON.parse(stdinData);
+    // Delete the temp file the entrypoint wrote — it contains secrets
+    try { fs.unlinkSync('/tmp/input.json'); } catch { /* may not exist */ }
+    log(`Received input for group: ${containerInput.groupFolder}`);
+  } catch (err) {
+    writeOutput({
+      status: 'error',
+      result: null,
+      error: `Failed to parse input: ${err instanceof Error ? err.message : String(err)}`
+    });
+    process.exit(1);
+  }
+
+  // Route to the appropriate backend
+  if (containerInput.llmBackend === 'openai') {
+    log(`Using OpenAI backend (model: ${containerInput.llmModel || 'gpt-4o'})`);
+    const { runOpenAIBackend } = await import('./openai-runner.js');
+    await runOpenAIBackend(containerInput);
+  } else {
+    log('Using Claude backend');
+    await runClaudeBackend(containerInput);
   }
 }
 
