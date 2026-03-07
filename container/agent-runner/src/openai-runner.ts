@@ -13,6 +13,7 @@ import fs from 'fs';
 import path from 'path';
 import OpenAI from 'openai';
 import type {
+  ChatCompletionAssistantMessageParam,
   ChatCompletionMessageParam,
   ChatCompletionTool,
   ChatCompletionMessageToolCall,
@@ -58,6 +59,34 @@ const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
 const MAX_TOOL_LOOPS = 50;
 const MAX_HISTORY_MESSAGES = 100;
 
+interface ResponseApiOutputTextItem {
+  type: 'output_text';
+  text?: string;
+}
+
+interface ResponseApiMessageItem {
+  type: 'message';
+  role?: string;
+  content?: ResponseApiOutputTextItem[];
+}
+
+interface ResponseApiFunctionCallItem {
+  type: 'function_call';
+  id?: string;
+  call_id?: string;
+  name?: string;
+  arguments?: string;
+}
+
+interface ResponseApiLikeResult {
+  output?: Array<ResponseApiMessageItem | ResponseApiFunctionCallItem>;
+}
+
+interface NormalizedAssistantTurn {
+  message: ChatCompletionAssistantMessageParam;
+  text: string | null;
+}
+
 // --- Utility functions ---
 
 function writeOutput(output: ContainerOutput): void {
@@ -70,9 +99,120 @@ function log(message: string): void {
   console.error(`[openai-runner] ${message}`);
 }
 
+function isStandardChatCompletionResponse(response: unknown): response is {
+  choices: Array<{
+    message: ChatCompletionAssistantMessageParam;
+  }>;
+} {
+  return (
+    typeof response === 'object' &&
+    response !== null &&
+    'choices' in response &&
+    Array.isArray((response as { choices?: unknown }).choices)
+  );
+}
+
+function isResponseApiLikeResult(
+  response: unknown,
+): response is ResponseApiLikeResult {
+  return (
+    typeof response === 'object' &&
+    response !== null &&
+    'output' in response &&
+    Array.isArray((response as { output?: unknown }).output)
+  );
+}
+
+function extractTextFromResponseMessage(
+  item: ResponseApiMessageItem,
+): string | null {
+  const texts = (item.content || [])
+    .filter(
+      (contentItem): contentItem is ResponseApiOutputTextItem =>
+        contentItem.type === 'output_text',
+    )
+    .map((contentItem) => contentItem.text || '')
+    .filter(Boolean);
+
+  return texts.length > 0 ? texts.join('\n') : null;
+}
+
+function normalizeAssistantTurn(
+  response: unknown,
+): NormalizedAssistantTurn | null {
+  if (isStandardChatCompletionResponse(response)) {
+    const choice = response.choices[0];
+    if (!choice) {
+      return null;
+    }
+
+    const message = choice.message;
+    return {
+      message,
+      text: typeof message.content === 'string' ? message.content : null,
+    };
+  }
+
+  if (!isResponseApiLikeResult(response)) {
+    return null;
+  }
+
+  const outputItems = response.output || [];
+  const toolCalls: ChatCompletionMessageToolCall[] = [];
+  const textParts: string[] = [];
+
+  for (const item of outputItems) {
+    if (item.type === 'function_call') {
+      if (!item.name) {
+        continue;
+      }
+
+      const toolCallId = item.call_id || item.id;
+      if (!toolCallId) {
+        continue;
+      }
+
+      toolCalls.push({
+        id: toolCallId,
+        type: 'function',
+        function: {
+          name: item.name,
+          arguments: item.arguments || '{}',
+        },
+      });
+      continue;
+    }
+
+    if (item.type === 'message' && item.role === 'assistant') {
+      const text = extractTextFromResponseMessage(item);
+      if (text) {
+        textParts.push(text);
+      }
+    }
+  }
+
+  if (toolCalls.length === 0 && textParts.length === 0) {
+    return null;
+  }
+
+  const text = textParts.length > 0 ? textParts.join('\n') : null;
+  return {
+    message: {
+      role: 'assistant',
+      content: text,
+      ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
+    },
+    text,
+  };
+}
+
 function shouldClose(): boolean {
   if (fs.existsSync(IPC_INPUT_CLOSE_SENTINEL)) {
-    try { fs.unlinkSync(IPC_INPUT_CLOSE_SENTINEL); } catch { /* ignore */ }
+    try {
+      fs.unlinkSync(IPC_INPUT_CLOSE_SENTINEL);
+    } catch {
+      /* ignore */
+    }
     return true;
   }
   return false;
@@ -81,8 +221,9 @@ function shouldClose(): boolean {
 function drainIpcInput(): string[] {
   try {
     fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
-    const files = fs.readdirSync(IPC_INPUT_DIR)
-      .filter(f => f.endsWith('.json'))
+    const files = fs
+      .readdirSync(IPC_INPUT_DIR)
+      .filter((f) => f.endsWith('.json'))
       .sort();
 
     const messages: string[] = [];
@@ -95,8 +236,14 @@ function drainIpcInput(): string[] {
           messages.push(data.text);
         }
       } catch (err) {
-        log(`Failed to process input file ${file}: ${err instanceof Error ? err.message : String(err)}`);
-        try { fs.unlinkSync(filePath); } catch { /* ignore */ }
+        log(
+          `Failed to process input file ${file}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        try {
+          fs.unlinkSync(filePath);
+        } catch {
+          /* ignore */
+        }
       }
     }
     return messages;
@@ -146,12 +293,16 @@ function buildToolDefinitions(isMain: boolean): ChatCompletionTool[] {
     type: 'function',
     function: {
       name: 'send_message',
-      description: "Send a message to the user or group immediately while you're still running. Use this for progress updates or to send multiple messages.",
+      description:
+        "Send a message to the user or group immediately while you're still running. Use this for progress updates or to send multiple messages.",
       parameters: {
         type: 'object',
         properties: {
           text: { type: 'string', description: 'The message text to send' },
-          sender: { type: 'string', description: 'Your role/identity name (e.g. "Researcher").' },
+          sender: {
+            type: 'string',
+            description: 'Your role/identity name (e.g. "Researcher").',
+          },
         },
         required: ['text'],
       },
@@ -163,15 +314,33 @@ function buildToolDefinitions(isMain: boolean): ChatCompletionTool[] {
     type: 'function',
     function: {
       name: 'schedule_task',
-      description: 'Schedule a recurring or one-time task. Returns the task ID.',
+      description:
+        'Schedule a recurring or one-time task. Returns the task ID.',
       parameters: {
         type: 'object',
         properties: {
-          prompt: { type: 'string', description: 'What the agent should do when the task runs.' },
-          schedule_type: { type: 'string', enum: ['cron', 'interval', 'once'], description: 'cron=recurring, interval=every N ms, once=run once' },
-          schedule_value: { type: 'string', description: 'cron expression, milliseconds, or local timestamp' },
-          context_mode: { type: 'string', enum: ['group', 'isolated'], description: 'group=with chat history, isolated=fresh session' },
-          target_group_jid: { type: 'string', description: '(Main only) JID of target group' },
+          prompt: {
+            type: 'string',
+            description: 'What the agent should do when the task runs.',
+          },
+          schedule_type: {
+            type: 'string',
+            enum: ['cron', 'interval', 'once'],
+            description: 'cron=recurring, interval=every N ms, once=run once',
+          },
+          schedule_value: {
+            type: 'string',
+            description: 'cron expression, milliseconds, or local timestamp',
+          },
+          context_mode: {
+            type: 'string',
+            enum: ['group', 'isolated'],
+            description: 'group=with chat history, isolated=fresh session',
+          },
+          target_group_jid: {
+            type: 'string',
+            description: '(Main only) JID of target group',
+          },
         },
         required: ['prompt', 'schedule_type', 'schedule_value'],
       },
@@ -183,7 +352,8 @@ function buildToolDefinitions(isMain: boolean): ChatCompletionTool[] {
     type: 'function',
     function: {
       name: 'list_tasks',
-      description: "List all scheduled tasks. Main sees all; others see only their group's tasks.",
+      description:
+        "List all scheduled tasks. Main sees all; others see only their group's tasks.",
       parameters: { type: 'object', properties: {} },
     },
   });
@@ -241,7 +411,8 @@ function buildToolDefinitions(isMain: boolean): ChatCompletionTool[] {
     type: 'function',
     function: {
       name: 'update_task',
-      description: 'Update an existing scheduled task. Only provided fields are changed.',
+      description:
+        'Update an existing scheduled task. Only provided fields are changed.',
       parameters: {
         type: 'object',
         properties: {
@@ -261,14 +432,22 @@ function buildToolDefinitions(isMain: boolean): ChatCompletionTool[] {
       type: 'function',
       function: {
         name: 'register_group',
-        description: 'Register a new chat/group so the agent can respond to messages there. Main group only.',
+        description:
+          'Register a new chat/group so the agent can respond to messages there. Main group only.',
         parameters: {
           type: 'object',
           properties: {
             jid: { type: 'string', description: 'The chat JID' },
             name: { type: 'string', description: 'Display name for the group' },
-            folder: { type: 'string', description: 'Channel-prefixed folder name (e.g., "whatsapp_family-chat")' },
-            trigger: { type: 'string', description: 'Trigger word (e.g., "@Andy")' },
+            folder: {
+              type: 'string',
+              description:
+                'Channel-prefixed folder name (e.g., "whatsapp_family-chat")',
+            },
+            trigger: {
+              type: 'string',
+              description: 'Trigger word (e.g., "@Andy")',
+            },
           },
           required: ['jid', 'name', 'folder', 'trigger'],
         },
@@ -281,12 +460,19 @@ function buildToolDefinitions(isMain: boolean): ChatCompletionTool[] {
     type: 'function',
     function: {
       name: 'bash',
-      description: 'Execute a bash command in the container. Working directory is /workspace/group.',
+      description:
+        'Execute a bash command in the container. Working directory is /workspace/group.',
       parameters: {
         type: 'object',
         properties: {
-          command: { type: 'string', description: 'The bash command to execute' },
-          timeout: { type: 'number', description: 'Timeout in milliseconds (default: 120000)' },
+          command: {
+            type: 'string',
+            description: 'The bash command to execute',
+          },
+          timeout: {
+            type: 'number',
+            description: 'Timeout in milliseconds (default: 120000)',
+          },
         },
         required: ['command'],
       },
@@ -302,8 +488,14 @@ function buildToolDefinitions(isMain: boolean): ChatCompletionTool[] {
       parameters: {
         type: 'object',
         properties: {
-          path: { type: 'string', description: 'Absolute or relative path to the file' },
-          offset: { type: 'number', description: 'Line number to start from (1-based)' },
+          path: {
+            type: 'string',
+            description: 'Absolute or relative path to the file',
+          },
+          offset: {
+            type: 'number',
+            description: 'Line number to start from (1-based)',
+          },
           limit: { type: 'number', description: 'Number of lines to read' },
         },
         required: ['path'],
@@ -337,8 +529,14 @@ function buildToolDefinitions(isMain: boolean): ChatCompletionTool[] {
       parameters: {
         type: 'object',
         properties: {
-          pattern: { type: 'string', description: 'Glob pattern (e.g., "**/*.ts")' },
-          path: { type: 'string', description: 'Directory to search in (default: /workspace/group)' },
+          pattern: {
+            type: 'string',
+            description: 'Glob pattern (e.g., "**/*.ts")',
+          },
+          path: {
+            type: 'string',
+            description: 'Directory to search in (default: /workspace/group)',
+          },
         },
         required: ['pattern'],
       },
@@ -354,9 +552,19 @@ function buildToolDefinitions(isMain: boolean): ChatCompletionTool[] {
       parameters: {
         type: 'object',
         properties: {
-          pattern: { type: 'string', description: 'Regex pattern to search for' },
-          path: { type: 'string', description: 'File or directory to search in (default: /workspace/group)' },
-          include: { type: 'string', description: 'Glob pattern to filter files (e.g., "*.ts")' },
+          pattern: {
+            type: 'string',
+            description: 'Regex pattern to search for',
+          },
+          path: {
+            type: 'string',
+            description:
+              'File or directory to search in (default: /workspace/group)',
+          },
+          include: {
+            type: 'string',
+            description: 'Glob pattern to filter files (e.g., "*.ts")',
+          },
         },
         required: ['pattern'],
       },
@@ -369,7 +577,11 @@ function buildToolDefinitions(isMain: boolean): ChatCompletionTool[] {
 // --- Tool execution ---
 
 // Secrets to strip from Bash tool subprocess environments
-const SECRET_ENV_VARS = ['ANTHROPIC_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN', 'OPENAI_API_KEY'];
+const SECRET_ENV_VARS = [
+  'ANTHROPIC_API_KEY',
+  'CLAUDE_CODE_OAUTH_TOKEN',
+  'OPENAI_API_KEY',
+];
 
 function executeTool(
   name: string,
@@ -399,13 +611,20 @@ function executeTool(
 
         // Validate
         if (scheduleType === 'cron') {
-          try { CronExpressionParser.parse(scheduleValue); }
-          catch { return `Invalid cron: "${scheduleValue}". Use format like "0 9 * * *".`; }
+          try {
+            CronExpressionParser.parse(scheduleValue);
+          } catch {
+            return `Invalid cron: "${scheduleValue}". Use format like "0 9 * * *".`;
+          }
         } else if (scheduleType === 'interval') {
           const ms = parseInt(scheduleValue, 10);
-          if (isNaN(ms) || ms <= 0) return `Invalid interval: "${scheduleValue}".`;
+          if (isNaN(ms) || ms <= 0)
+            return `Invalid interval: "${scheduleValue}".`;
         } else if (scheduleType === 'once') {
-          if (/[Zz]$/.test(scheduleValue) || /[+-]\d{2}:\d{2}$/.test(scheduleValue)) {
+          if (
+            /[Zz]$/.test(scheduleValue) ||
+            /[+-]\d{2}:\d{2}$/.test(scheduleValue)
+          ) {
             return `Timestamp must be local time without timezone suffix. Got "${scheduleValue}".`;
           }
           if (isNaN(new Date(scheduleValue).getTime())) {
@@ -413,7 +632,10 @@ function executeTool(
           }
         }
 
-        const targetJid = isMain && args.target_group_jid ? args.target_group_jid as string : chatJid;
+        const targetJid =
+          isMain && args.target_group_jid
+            ? (args.target_group_jid as string)
+            : chatJid;
         const taskId = `task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
         writeIpcFile(TASKS_DIR, {
@@ -438,14 +660,28 @@ function executeTool(
         const allTasks = JSON.parse(fs.readFileSync(tasksFile, 'utf-8'));
         const tasks = isMain
           ? allTasks
-          : allTasks.filter((t: { groupFolder: string }) => t.groupFolder === groupFolder);
+          : allTasks.filter(
+              (t: { groupFolder: string }) => t.groupFolder === groupFolder,
+            );
 
         if (tasks.length === 0) return 'No scheduled tasks found.';
 
-        return 'Scheduled tasks:\n' + tasks
-          .map((t: { id: string; prompt: string; schedule_type: string; schedule_value: string; status: string; next_run: string }) =>
-            `- [${t.id}] ${t.prompt.slice(0, 50)}... (${t.schedule_type}: ${t.schedule_value}) - ${t.status}, next: ${t.next_run || 'N/A'}`)
-          .join('\n');
+        return (
+          'Scheduled tasks:\n' +
+          tasks
+            .map(
+              (t: {
+                id: string;
+                prompt: string;
+                schedule_type: string;
+                schedule_value: string;
+                status: string;
+                next_run: string;
+              }) =>
+                `- [${t.id}] ${t.prompt.slice(0, 50)}... (${t.schedule_type}: ${t.schedule_value}) - ${t.status}, next: ${t.next_run || 'N/A'}`,
+            )
+            .join('\n')
+        );
       }
 
       case 'pause_task': {
@@ -490,8 +726,10 @@ function executeTool(
           timestamp: new Date().toISOString(),
         };
         if (args.prompt !== undefined) data.prompt = args.prompt as string;
-        if (args.schedule_type !== undefined) data.schedule_type = args.schedule_type as string;
-        if (args.schedule_value !== undefined) data.schedule_value = args.schedule_value as string;
+        if (args.schedule_type !== undefined)
+          data.schedule_type = args.schedule_type as string;
+        if (args.schedule_value !== undefined)
+          data.schedule_value = args.schedule_value as string;
 
         writeIpcFile(TASKS_DIR, data);
         return `Task ${args.task_id} update requested.`;
@@ -526,7 +764,12 @@ function executeTool(
           const result = execSync(unsetPrefix + command, opts);
           return result || '(no output)';
         } catch (err: unknown) {
-          const execErr = err as { status?: number; stdout?: string; stderr?: string; message?: string };
+          const execErr = err as {
+            status?: number;
+            stdout?: string;
+            stderr?: string;
+            message?: string;
+          };
           const stdout = execErr.stdout || '';
           const stderr = execErr.stderr || '';
           return `Exit code: ${execErr.status || 'unknown'}\nStdout: ${stdout}\nStderr: ${stderr}`;
@@ -535,7 +778,9 @@ function executeTool(
 
       case 'read_file': {
         const filePath = args.path as string;
-        const absPath = path.isAbsolute(filePath) ? filePath : path.join('/workspace/group', filePath);
+        const absPath = path.isAbsolute(filePath)
+          ? filePath
+          : path.join('/workspace/group', filePath);
 
         if (!fs.existsSync(absPath)) return `File not found: ${absPath}`;
 
@@ -547,13 +792,17 @@ function executeTool(
         const selected = lines.slice(offset, offset + limit);
 
         return selected
-          .map((line, i) => `${(offset + i + 1).toString().padStart(6)}\t${line}`)
+          .map(
+            (line, i) => `${(offset + i + 1).toString().padStart(6)}\t${line}`,
+          )
           .join('\n');
       }
 
       case 'write_file': {
         const filePath = args.path as string;
-        const absPath = path.isAbsolute(filePath) ? filePath : path.join('/workspace/group', filePath);
+        const absPath = path.isAbsolute(filePath)
+          ? filePath
+          : path.join('/workspace/group', filePath);
 
         fs.mkdirSync(path.dirname(absPath), { recursive: true });
         fs.writeFileSync(absPath, args.content as string);
@@ -622,7 +871,9 @@ function buildSystemPrompt(containerInput: ContainerInput): string {
   // Base instructions
   const assistantName = containerInput.assistantName || 'Assistant';
   parts.push(`You are ${assistantName}, an AI assistant.`);
-  parts.push('You have access to tools for executing bash commands, reading/writing files, searching files and content, sending messages, and managing scheduled tasks.');
+  parts.push(
+    'You have access to tools for executing bash commands, reading/writing files, searching files and content, sending messages, and managing scheduled tasks.',
+  );
   parts.push('Your working directory is /workspace/group.');
   parts.push(`Current time: ${new Date().toISOString()}`);
 
@@ -653,12 +904,16 @@ async function runAgentLoop(
         tool_choice: tools.length > 0 ? 'auto' : undefined,
       });
     } catch (err: unknown) {
-      const apiErr = err as { status?: number; message?: string; error?: { message?: string } };
+      const apiErr = err as {
+        status?: number;
+        message?: string;
+        error?: { message?: string };
+      };
 
       // Rate limit: wait and retry
       if (apiErr.status === 429) {
         log('Rate limited, waiting 10s before retry...');
-        await new Promise(r => setTimeout(r, 10000));
+        await new Promise((r) => setTimeout(r, 10000));
         continue;
       }
 
@@ -678,18 +933,21 @@ async function runAgentLoop(
       throw err;
     }
 
-    const choice = response.choices[0];
-    if (!choice) {
-      log('No choices in response');
+    const normalizedTurn = normalizeAssistantTurn(response);
+    if (!normalizedTurn) {
+      log('No assistant message in response');
       return null;
     }
 
-    const assistantMessage = choice.message;
+    const assistantMessage = normalizedTurn.message;
     messages.push(assistantMessage);
 
     // If no tool calls, we're done
-    if (!assistantMessage.tool_calls || assistantMessage.tool_calls.length === 0) {
-      return assistantMessage.content || null;
+    if (
+      !assistantMessage.tool_calls ||
+      assistantMessage.tool_calls.length === 0
+    ) {
+      return normalizedTurn.text;
     }
 
     // Execute tool calls
@@ -733,7 +991,9 @@ async function runAgentLoop(
 
 // --- Exported entry point ---
 
-export async function runOpenAIBackend(containerInput: ContainerInput): Promise<void> {
+export async function runOpenAIBackend(
+  containerInput: ContainerInput,
+): Promise<void> {
   const apiKey = containerInput.secrets?.OPENAI_API_KEY;
   const baseURL = containerInput.secrets?.OPENAI_BASE_URL;
   const model = containerInput.llmModel || 'gpt-4o';
@@ -742,7 +1002,8 @@ export async function runOpenAIBackend(containerInput: ContainerInput): Promise<
     writeOutput({
       status: 'error',
       result: null,
-      error: 'OPENAI_API_KEY not set. Add it to .env or set it as an environment variable.',
+      error:
+        'OPENAI_API_KEY not set. Add it to .env or set it as an environment variable.',
     });
     process.exit(1);
   }
@@ -752,7 +1013,9 @@ export async function runOpenAIBackend(containerInput: ContainerInput): Promise<
     baseURL: baseURL || undefined,
   });
 
-  log(`OpenAI backend initialized (model: ${model}, baseURL: ${baseURL || 'default'})`);
+  log(
+    `OpenAI backend initialized (model: ${model}, baseURL: ${baseURL || 'default'})`,
+  );
 
   const tools = buildToolDefinitions(containerInput.isMain);
   const systemPrompt = buildSystemPrompt(containerInput);
@@ -764,7 +1027,11 @@ export async function runOpenAIBackend(containerInput: ContainerInput): Promise<
 
   fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
   // Clean up stale _close sentinel
-  try { fs.unlinkSync(IPC_INPUT_CLOSE_SENTINEL); } catch { /* ignore */ }
+  try {
+    fs.unlinkSync(IPC_INPUT_CLOSE_SENTINEL);
+  } catch {
+    /* ignore */
+  }
 
   // Build initial prompt
   let prompt = containerInput.prompt;
@@ -795,7 +1062,13 @@ export async function runOpenAIBackend(containerInput: ContainerInput): Promise<
       }
 
       // Run agent loop
-      const result = await runAgentLoop(client, model, messages, tools, containerInput);
+      const result = await runAgentLoop(
+        client,
+        model,
+        messages,
+        tools,
+        containerInput,
+      );
 
       writeOutput({
         status: 'success',

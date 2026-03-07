@@ -12,7 +12,7 @@
   <a href="https://discord.gg/VDdww8qS42"><img src="https://img.shields.io/discord/1470188214710046894?label=Discord&logo=discord&v=2" alt="Discord" valign="middle"></a>&nbsp; • &nbsp;
   <a href="repo-tokens"><img src="repo-tokens/badge.svg" alt="34.9k tokens, 17% of context window" valign="middle"></a>
 </p>
-通过 Claude Code，NanoClaw 可以动态重写自身代码，根据您的需求定制功能。
+通过 Claude Code 作为定制与编排层，NanoClaw 可以动态重写自身代码，根据您的需求定制功能。
 
 **新功能：** 首个支持 [Agent Swarms（智能体集群）](https://code.claude.com/docs/en/agent-teams) 的 AI 助手。可轻松组建智能体团队，在您的聊天中高效协作。
 
@@ -34,6 +34,20 @@ claude
 
 > **注意：** 以 `/` 开头的命令（如 `/setup`、`/add-whatsapp`）是 [Claude Code 技能](https://code.claude.com/docs/en/skills)。请在 `claude` CLI 提示符中输入，而非在普通终端中。
 
+## LLM 后端
+
+NanoClaw 默认使用 Claude，但现在也支持接入 OpenAI 兼容 API。
+
+```env
+LLM_BACKEND=openai
+OPENAI_API_KEY=sk-...
+# 填写提供商的完整 API 根路径；大多数兼容网关都需要以 /v1 结尾。
+OPENAI_BASE_URL=https://api.openai.com/v1
+OPENAI_MODEL=gpt-4o
+```
+
+如果您使用 OpenAI 兼容提供商，请确认它完整支持工具 / 函数调用。NanoClaw 的 Shell、文件编辑、计划任务与管理能力都依赖工具调用链路。
+
 ## 设计哲学
 
 **小巧易懂：** 单一进程，少量源文件。无微服务、无消息队列、无复杂抽象层。让 Claude Code 引导您轻松上手。
@@ -48,7 +62,7 @@ claude
 
 **技能（Skills）优于功能（Features）:** 贡献者不应该向代码库添加新功能（例如支持 Telegram）。相反，他们应该贡献像 `/add-telegram` 这样的 [Claude Code 技能](https://code.claude.com/docs/en/skills)，这些技能可以改造您的 fork。最终，您得到的是只做您需要事情的整洁代码。
 
-**最好的工具套件，最好的模型:** 本项目运行在 Claude Agent SDK 之上，这意味着您直接运行的就是 Claude Code。Claude Code 高度强大，其编码和问题解决能力使其能够修改和扩展 NanoClaw，为每个用户量身定制。
+**最好的工具套件，自由选择模型：** NanoClaw 使用 Claude Code 负责定制与编排，而运行时的大模型后端既可以是 Claude，也可以是 OpenAI 兼容 API。
 
 ## 功能支持
 

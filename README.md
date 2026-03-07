@@ -12,7 +12,7 @@
   <a href="https://discord.gg/VDdww8qS42"><img src="https://img.shields.io/discord/1470188214710046894?label=Discord&logo=discord&v=2" alt="Discord" valign="middle"></a>&nbsp; • &nbsp;
   <a href="repo-tokens"><img src="repo-tokens/badge.svg" alt="34.9k tokens, 17% of context window" valign="middle"></a>
 </p>
-Using Claude Code, NanoClaw can dynamically rewrite its code to customize its feature set for your needs.
+Using Claude Code as its customization harness, NanoClaw can dynamically rewrite its code to customize its feature set for your needs.
 
 **New:** First AI assistant to support [Agent Swarms](https://code.claude.com/docs/en/agent-teams). Spin up teams of agents that collaborate in your chat.
 
@@ -34,6 +34,20 @@ Then run `/setup`. Claude Code handles everything: dependencies, authentication,
 
 > **Note:** Commands prefixed with `/` (like `/setup`, `/add-whatsapp`) are [Claude Code skills](https://code.claude.com/docs/en/skills). Type them inside the `claude` CLI prompt, not in your regular terminal.
 
+## LLM Backends
+
+NanoClaw defaults to Claude, but it can also run against OpenAI-compatible APIs.
+
+```env
+LLM_BACKEND=openai
+OPENAI_API_KEY=sk-...
+# Use the provider's full API root. Most compatible gateways expect /v1.
+OPENAI_BASE_URL=https://api.openai.com/v1
+OPENAI_MODEL=gpt-4o
+```
+
+If you use an OpenAI-compatible provider, make sure it supports tool/function calling end-to-end. NanoClaw relies on tool calls for shell access, file edits, scheduled tasks, and admin actions.
+
 ## Philosophy
 
 **Small enough to understand.** One process, a few source files and no microservices. If you want to understand the full NanoClaw codebase, just ask Claude Code to walk you through it.
@@ -52,7 +66,7 @@ Then run `/setup`. Claude Code handles everything: dependencies, authentication,
 
 **Skills over features.** Instead of adding features (e.g. support for Telegram) to the codebase, contributors submit [claude code skills](https://code.claude.com/docs/en/skills) like `/add-telegram` that transform your fork. You end up with clean code that does exactly what you need.
 
-**Best harness, best model.** NanoClaw runs on the Claude Agent SDK, which means you're running Claude Code directly. Claude Code is highly capable and its coding and problem-solving capabilities allow it to modify and expand NanoClaw and tailor it to each user.
+**Best harness, your choice of model.** NanoClaw uses Claude Code as the customization and orchestration layer, while runtime LLM requests can use Claude or an OpenAI-compatible API.
 
 ## What It Supports
 
