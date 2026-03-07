@@ -10,7 +10,11 @@ import { setRegisteredGroup } from '../db.js';
 import { readEnvFile } from '../env.js';
 import { resolveGroupFolderPath } from '../group-folder.js';
 import { logger } from '../logger.js';
-import { NapCatFleetManager } from '../napcat-fleet.js';
+import {
+  NapCatFleetManager,
+  type NapCatLoginLifecycleEvent,
+  type NapCatLoginLifecycleState,
+} from '../napcat-fleet.js';
 import {
   generateQrCodePngBase64,
   generateQrCodeSvg,
@@ -115,6 +119,9 @@ interface LoginTicketView {
   svg: string;
   createdAt: string;
   expiresAt: string;
+  chatId: string;
+  chatJid: string;
+  notifiedStates: Set<NapCatLoginLifecycleState>;
 }
 
 interface OutboundJob {
@@ -554,6 +561,74 @@ export class QQBridgeChannel implements Channel {
     return `${baseUrl}/qq-bridge/bot-login/${encodeURIComponent(ticketId)}`;
   }
 
+  private formatLoginTicketLifecycleMessage(
+    ticket: LoginTicketView,
+    event: NapCatLoginLifecycleEvent,
+  ): string {
+    const expiresAtText = new Date(event.expiresAt).toLocaleString('zh-CN', {
+      hour12: false,
+    });
+    const previewUrl = this.buildTicketPreviewUrl(ticket.id);
+
+    switch (event.state) {
+      case 'qr_ready': {
+        const lines = [
+          '✅ 已生成新的机器人登录二维码。',
+          `会话ID：${event.ticketId}`,
+          `二维码有效期至：${expiresAtText}`,
+          '如果二维码过期，请重新私聊发送“刷新机器人二维码”。',
+        ];
+        if (previewUrl) {
+          lines.push(`备用预览地址：${previewUrl}`);
+        }
+        return lines.join('\n');
+      }
+      case 'scanned':
+        return [
+          '📱 二维码已扫码，等待手机确认。',
+          `会话ID：${event.ticketId}`,
+        ].join('\n');
+      case 'success': {
+        const lines = ['✅ 新账号已接入机器人账号池。'];
+        if (event.qqAccount) {
+          lines.push(`QQ号：${event.qqAccount}`);
+        }
+        if (event.nickname) {
+          lines.push(`昵称：${event.nickname}`);
+        }
+        return lines.join('\n');
+      }
+      case 'expired':
+        return [
+          '⌛ 二维码已过期。',
+          '请重新私聊发送“刷新机器人二维码”获取新的登录二维码。',
+        ].join('\n');
+      case 'failed':
+        return `⚠️ 登录失败：${event.reason || '未知错误'}`;
+      default:
+        return '⚠️ 登录状态已更新。';
+    }
+  }
+
+  private async handleLoginTicketLifecycleEvent(
+    event: NapCatLoginLifecycleEvent,
+  ): Promise<void> {
+    this.cleanupLoginTickets();
+    const ticket = this.loginTickets.get(event.ticketId);
+    if (!ticket) {
+      return;
+    }
+    if (ticket.notifiedStates.has(event.state)) {
+      return;
+    }
+
+    ticket.notifiedStates.add(event.state);
+    await this.sendMessage(
+      ticket.chatJid,
+      this.formatLoginTicketLifecycleMessage(ticket, event),
+    );
+  }
+
   private async sendBotLoginTicket(
     chatId: string,
     chatJid: string,
@@ -567,7 +642,16 @@ export class QQBridgeChannel implements Channel {
     }
 
     try {
-      const ticket = await this.fleetManager.createAgentLoginTicket();
+      const bufferedEvents: NapCatLoginLifecycleEvent[] = [];
+      const ticket = await this.fleetManager.createAgentLoginTicket({
+        onEvent: async (event) => {
+          if (!this.loginTickets.has(event.ticketId)) {
+            bufferedEvents.push(event);
+            return;
+          }
+          await this.handleLoginTicketLifecycleEvent(event);
+        },
+      });
       const svg = await generateQrCodeSvg(ticket.qrCodeText);
       const pngBase64 = await generateQrCodePngBase64(ticket.qrCodeText);
       this.loginTickets.set(ticket.id, {
@@ -575,26 +659,26 @@ export class QQBridgeChannel implements Channel {
         svg,
         createdAt: ticket.createdAt,
         expiresAt: ticket.expiresAt,
+        chatId,
+        chatJid,
+        notifiedStates: new Set<NapCatLoginLifecycleState>(),
       });
       this.cleanupLoginTickets();
 
-      const previewUrl = this.buildTicketPreviewUrl(ticket.id);
-      const expiresAtText = new Date(ticket.expiresAt).toLocaleString('zh-CN', {
-        hour12: false,
-      });
-
-      const lines = [
-        '✅ 已创建新的机器人账号登录会话。',
-        `会话ID：${ticket.id}`,
-        `二维码有效期至：${expiresAtText}`,
-        '请尽快扫码，登录成功后系统会自动把新账号接入 Agent 池。',
-      ];
-      if (previewUrl) {
-        lines.push(`备用预览地址：${previewUrl}`);
+      if (bufferedEvents.length === 0) {
+        bufferedEvents.push({
+          ticketId: ticket.id,
+          state: 'qr_ready',
+          role: ticket.role,
+          occurredAt: new Date().toISOString(),
+          createdAt: ticket.createdAt,
+          expiresAt: ticket.expiresAt,
+        });
       }
-      lines.push('如果二维码过期了，重新私聊发送“刷新机器人二维码”即可。');
 
-      await this.sendMessage(chatJid, lines.join('\n'));
+      for (const event of bufferedEvents) {
+        await this.handleLoginTicketLifecycleEvent(event);
+      }
 
       const mainConnector = this.fleetManager.getMainConnector();
       if (mainConnector) {

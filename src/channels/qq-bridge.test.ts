@@ -295,15 +295,26 @@ describe('QQBridgeChannel', () => {
     const sendPrivateImageBase64 = vi
       .fn()
       .mockResolvedValue({ retcode: 0, status: 'ok' });
-
-    channel.setFleetManager({
-      createAgentLoginTicket: vi.fn().mockResolvedValue({
+    const createAgentLoginTicket = vi.fn().mockImplementation(async (options?: any) => {
+      await options?.onEvent?.({
+        ticketId: 'ticket-1',
+        state: 'qr_ready',
+        role: 'agent',
+        occurredAt: '2026-03-07T23:50:01.000Z',
+        createdAt: '2026-03-07T23:50:00.000Z',
+        expiresAt: '2026-03-08T00:10:00.000Z',
+      });
+      return {
         id: 'ticket-1',
         role: 'agent',
         qrCodeText: 'https://example.com/login?token=abc',
         createdAt: '2026-03-07T23:50:00.000Z',
         expiresAt: '2026-03-08T00:10:00.000Z',
-      }),
+      };
+    });
+
+    channel.setFleetManager({
+      createAgentLoginTicket,
       getMainConnector: () => ({
         sendPrivateMsg,
         sendPrivateImageBase64,
@@ -335,6 +346,13 @@ describe('QQBridgeChannel', () => {
     expect(body.registered).toBe(true);
     expect(opts.onMessage).not.toHaveBeenCalled();
     expect(sendPrivateMsg).toHaveBeenCalledTimes(1);
+    expect(sendPrivateMsg).toHaveBeenCalledWith(
+      '1000',
+      expect.stringContaining('已生成新的机器人登录二维码'),
+    );
+    expect(sendPrivateMsg.mock.calls[0]?.[1]).toContain(
+      '备用预览地址：https://bot.example.com/qq-bridge/bot-login/ticket-1',
+    );
     expect(sendPrivateImageBase64).toHaveBeenCalledTimes(1);
 
     const qrResponse = await fetch(
@@ -343,6 +361,111 @@ describe('QQBridgeChannel', () => {
     const qrBody = await qrResponse.text();
     expect(qrResponse.status).toBe(200);
     expect(qrBody).toContain('<svg');
+
+    await channel.disconnect();
+  });
+
+  it('only notifies the requesting private chat once per lifecycle state', async () => {
+    const { opts } = createOpts();
+    const channel = new QQBridgeChannel(
+      createConfig({ publicBaseUrl: 'https://bot.example.com' }),
+      opts,
+      vi
+        .fn()
+        .mockResolvedValue(new Response('{}', { status: 200 })) as typeof fetch,
+    );
+
+    const sendPrivateMsg = vi.fn().mockResolvedValue({ retcode: 0, status: 'ok' });
+    const sendPrivateImageBase64 = vi
+      .fn()
+      .mockResolvedValue({ retcode: 0, status: 'ok' });
+    let onEvent:
+      | ((event: {
+          ticketId: string;
+          state: string;
+          role: string;
+          occurredAt: string;
+          createdAt: string;
+          expiresAt: string;
+          qqAccount?: string;
+          nickname?: string;
+          reason?: string;
+        }) => Promise<void>)
+      | undefined;
+
+    channel.setFleetManager({
+      createAgentLoginTicket: vi.fn().mockImplementation(async (options?: any) => {
+        onEvent = options?.onEvent;
+        return {
+          id: 'ticket-1',
+          role: 'agent',
+          qrCodeText: 'https://example.com/login?token=abc',
+          createdAt: '2026-03-07T23:50:00.000Z',
+          expiresAt: '2026-03-08T00:10:00.000Z',
+        };
+      }),
+      getMainConnector: () => ({
+        sendPrivateMsg,
+        sendPrivateImageBase64,
+      }),
+    } as any);
+
+    await channel.connect();
+    const port = channel.getPort();
+
+    const response = await fetch(`http://127.0.0.1:${port}/qq-bridge/inbound`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-qq-bridge-secret': 'test-secret',
+      },
+      body: JSON.stringify({
+        chat: { id: '1000', type: 'private', name: 'Alice' },
+        sender: { id: '2000', name: 'Alice' },
+        message: { text: '加机器人账号' },
+      }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(sendPrivateMsg).toHaveBeenCalledTimes(1);
+
+    await onEvent?.({
+      ticketId: 'ticket-1',
+      state: 'scanned',
+      role: 'agent',
+      occurredAt: '2026-03-07T23:51:00.000Z',
+      createdAt: '2026-03-07T23:50:00.000Z',
+      expiresAt: '2026-03-08T00:10:00.000Z',
+    });
+    await onEvent?.({
+      ticketId: 'ticket-1',
+      state: 'scanned',
+      role: 'agent',
+      occurredAt: '2026-03-07T23:51:05.000Z',
+      createdAt: '2026-03-07T23:50:00.000Z',
+      expiresAt: '2026-03-08T00:10:00.000Z',
+    });
+    await onEvent?.({
+      ticketId: 'ticket-1',
+      state: 'success',
+      role: 'agent',
+      occurredAt: '2026-03-07T23:51:30.000Z',
+      createdAt: '2026-03-07T23:50:00.000Z',
+      expiresAt: '2026-03-08T00:10:00.000Z',
+      qqAccount: '30001',
+      nickname: 'Agent One',
+    });
+
+    expect(sendPrivateMsg).toHaveBeenCalledTimes(3);
+    expect(sendPrivateMsg.mock.calls.map((call) => call[0])).toEqual([
+      '1000',
+      '1000',
+      '1000',
+    ]);
+    expect(sendPrivateMsg.mock.calls[1]?.[1]).toContain('二维码已扫码');
+    expect(sendPrivateMsg.mock.calls[2]?.[1]).toContain('新账号已接入机器人账号池');
+    expect(sendPrivateMsg.mock.calls[2]?.[1]).toContain('QQ号：30001');
+    expect(sendPrivateMsg.mock.calls[2]?.[1]).toContain('昵称：Agent One');
 
     await channel.disconnect();
   });

@@ -21,6 +21,40 @@ const execAsync = promisify(exec);
 
 export type AccountRole = 'main' | 'agent';
 
+export type NapCatLoginLifecycleState =
+  | 'qr_ready'
+  | 'scanned'
+  | 'success'
+  | 'expired'
+  | 'failed';
+
+type NapCatWebUiLoginStage =
+  | 'idle'
+  | 'qr_ready'
+  | 'scanned'
+  | 'success'
+  | 'expired'
+  | 'failed';
+
+export interface NapCatLoginLifecycleEvent {
+  ticketId: string;
+  state: NapCatLoginLifecycleState;
+  role: AccountRole;
+  occurredAt: string;
+  createdAt: string;
+  expiresAt: string;
+  qqAccount?: string;
+  nickname?: string;
+  reason?: string;
+}
+
+export interface CreateAgentLoginTicketOptions {
+  role?: AccountRole;
+  onEvent?: (
+    event: NapCatLoginLifecycleEvent,
+  ) => Promise<void> | void;
+}
+
 export interface NapCatAccountConfig {
   qqAccount: string;
   role: AccountRole;
@@ -66,6 +100,11 @@ interface PendingLoginSession {
   role: AccountRole;
   createdAt: string;
   expiresAt: string;
+  onEvent?: CreateAgentLoginTicketOptions['onEvent'];
+  emittedStates: Set<NapCatLoginLifecycleState>;
+  webUiCredential?: string;
+  lastLoginStage?: NapCatWebUiLoginStage;
+  cleanupStarted?: boolean;
 }
 
 interface WebUiResponse<T> {
@@ -74,12 +113,21 @@ interface WebUiResponse<T> {
   data?: T;
 }
 
+interface PendingLoginStatusData {
+  isLogin: boolean;
+  isOffline?: boolean;
+  qrcodeurl?: string;
+  loginError?: string;
+  loginStage?: NapCatWebUiLoginStage;
+}
+
 const DYNAMIC_ACCOUNTS_PATH = path.join(
   DATA_DIR,
   'napcat',
   'dynamic-accounts.json',
 );
 const PENDING_LOGIN_TTL_MS = 10 * 60 * 1000;
+const PENDING_LOGIN_POLL_INTERVAL_MS = 2000;
 
 function parseAccounts(raw: string): NapCatAccountConfig[] {
   if (!raw) return [];
@@ -179,6 +227,7 @@ export function loadFleetConfig(): NapCatFleetConfig {
 export class NapCatFleetManager {
   private instances = new Map<string, NapCatInstance>();
   private healthCheckInterval: ReturnType<typeof setInterval> | null = null;
+  private pendingLoginInterval: ReturnType<typeof setInterval> | null = null;
   private readonly config: NapCatFleetConfig;
 
   constructor(config: NapCatFleetConfig) {
@@ -218,6 +267,14 @@ export class NapCatFleetManager {
     this.healthCheckInterval = setInterval(() => {
       void this.healthCheck();
     }, 30000);
+    this.ensurePendingLoginPolling();
+  }
+
+  private ensurePendingLoginPolling(): void {
+    if (this.pendingLoginInterval) return;
+    this.pendingLoginInterval = setInterval(() => {
+      void this.pollPendingLogins();
+    }, PENDING_LOGIN_POLL_INTERVAL_MS);
   }
 
   /**
@@ -387,16 +444,16 @@ export class NapCatFleetManager {
    */
   private async healthCheck(): Promise<void> {
     for (const [qqAccount, instance] of this.instances) {
+      if (instance.pendingLogin) {
+        instance.lastHealthCheck = new Date().toISOString();
+        continue;
+      }
+
       try {
         const alive = await instance.connector.isAlive();
         const prevStatus = instance.status;
         instance.status = alive ? 'running' : 'error';
         instance.lastHealthCheck = new Date().toISOString();
-
-        if (alive && instance.pendingLogin) {
-          await this.promotePendingLogin(qqAccount, instance);
-          continue;
-        }
 
         if (alive && prevStatus !== 'running') {
           logger.info({ qqAccount }, 'NapCat instance is now running');
@@ -427,6 +484,11 @@ export class NapCatFleetManager {
     if (this.healthCheckInterval) {
       clearInterval(this.healthCheckInterval);
       this.healthCheckInterval = null;
+    }
+
+    if (this.pendingLoginInterval) {
+      clearInterval(this.pendingLoginInterval);
+      this.pendingLoginInterval = null;
     }
 
     if (this.config.mode === 'docker') {
@@ -492,7 +554,9 @@ export class NapCatFleetManager {
     return Boolean(instance && !instance.pendingLogin);
   }
 
-  async createAgentLoginTicket(): Promise<NapCatLoginTicket> {
+  async createAgentLoginTicket(
+    options: CreateAgentLoginTicketOptions = {},
+  ): Promise<NapCatLoginTicket> {
     if (this.config.mode !== 'docker') {
       throw new Error('当前仅 Docker 模式支持扫码新增机器人账号');
     }
@@ -502,9 +566,11 @@ export class NapCatFleetManager {
     const now = Date.now();
     const pendingLogin: PendingLoginSession = {
       id,
-      role: 'agent',
+      role: options.role || 'agent',
       createdAt: new Date(now).toISOString(),
       expiresAt: new Date(now + PENDING_LOGIN_TTL_MS).toISOString(),
+      onEvent: options.onEvent,
+      emittedStates: new Set<NapCatLoginLifecycleState>(),
     };
 
     const httpPort = this.getNextAvailableHttpPort();
@@ -514,7 +580,7 @@ export class NapCatFleetManager {
     await this.startDockerInstance(
       {
         qqAccount: storageKey,
-        role: 'agent',
+        role: pendingLogin.role,
         storageKey,
       },
       httpPort,
@@ -528,11 +594,18 @@ export class NapCatFleetManager {
       },
     );
 
+    this.ensurePendingLoginPolling();
+
     try {
-      const qrCodeText = await this.fetchLoginQrCode(webUiPort, webUiToken);
+      const instance = this.instances.get(storageKey);
+      if (!instance) {
+        throw new Error('登录容器创建后未能注册到账号池');
+      }
+
+      const qrCodeText = await this.fetchLoginQrCode(instance);
       return {
         id,
-        role: 'agent',
+        role: pendingLogin.role,
         qrCodeText,
         createdAt: pendingLogin.createdAt,
         expiresAt: pendingLogin.expiresAt,
@@ -541,6 +614,7 @@ export class NapCatFleetManager {
       const instance = this.instances.get(storageKey);
       if (instance) {
         instance.status = 'error';
+        await this.cleanupPendingLogin(storageKey, instance);
       }
       throw err;
     }
@@ -570,11 +644,13 @@ export class NapCatFleetManager {
     return candidate;
   }
 
-  private async fetchLoginQrCode(
-    webUiPort: number,
-    webUiToken: string,
-  ): Promise<string> {
-    const credential = await this.loginWebUi(webUiPort, webUiToken);
+  private async fetchLoginQrCode(instance: NapCatInstance): Promise<string> {
+    const credential = await this.getPendingLoginCredential(instance);
+    const webUiPort = instance.webUiPort;
+    if (!webUiPort) {
+      throw new Error('登录容器未暴露 WebUI 端口');
+    }
+
     await this.callWebUi(webUiPort, credential, '/api/QQLogin/RefreshQRcode', {});
 
     for (let attempt = 0; attempt < 20; attempt++) {
@@ -586,6 +662,7 @@ export class NapCatFleetManager {
       );
 
       if (response.data?.qrcode) {
+        await this.emitPendingLoginEvent(instance, 'qr_ready');
         return response.data.qrcode;
       }
 
@@ -593,6 +670,190 @@ export class NapCatFleetManager {
     }
 
     throw new Error('二维码生成超时，请稍后重试');
+  }
+
+  private async emitPendingLoginEvent(
+    instance: NapCatInstance,
+    state: NapCatLoginLifecycleState,
+    details: Partial<
+      Pick<NapCatLoginLifecycleEvent, 'qqAccount' | 'nickname' | 'reason'>
+    > = {},
+  ): Promise<void> {
+    const pendingLogin = instance.pendingLogin;
+    if (!pendingLogin) return;
+    if (pendingLogin.emittedStates.has(state)) return;
+
+    pendingLogin.emittedStates.add(state);
+    if (!pendingLogin.onEvent) return;
+
+    const event: NapCatLoginLifecycleEvent = {
+      ticketId: pendingLogin.id,
+      state,
+      role: pendingLogin.role,
+      occurredAt: new Date().toISOString(),
+      createdAt: pendingLogin.createdAt,
+      expiresAt: pendingLogin.expiresAt,
+      qqAccount: details.qqAccount,
+      nickname: details.nickname,
+      reason: details.reason,
+    };
+
+    try {
+      await pendingLogin.onEvent(event);
+    } catch (err) {
+      logger.warn(
+        { err, ticketId: pendingLogin.id, state },
+        'Failed to dispatch pending login lifecycle event',
+      );
+    }
+  }
+
+  private async getPendingLoginCredential(
+    instance: NapCatInstance,
+  ): Promise<string> {
+    const pendingLogin = instance.pendingLogin;
+    if (!pendingLogin) {
+      throw new Error('登录会话不存在');
+    }
+    if (pendingLogin.webUiCredential) {
+      return pendingLogin.webUiCredential;
+    }
+    if (!instance.webUiPort || !instance.webUiToken) {
+      throw new Error('登录容器缺少 WebUI 配置');
+    }
+
+    const credential = await this.loginWebUi(instance.webUiPort, instance.webUiToken);
+    pendingLogin.webUiCredential = credential;
+    return credential;
+  }
+
+  private async getPendingLoginStatus(
+    instance: NapCatInstance,
+  ): Promise<PendingLoginStatusData> {
+    if (!instance.webUiPort) {
+      throw new Error('登录容器未暴露 WebUI 端口');
+    }
+    const credential = await this.getPendingLoginCredential(instance);
+    const response = await this.callWebUi<PendingLoginStatusData>(
+      instance.webUiPort,
+      credential,
+      '/api/QQLogin/CheckLoginStatus',
+      {},
+    );
+    return response.data || { isLogin: false, loginStage: 'idle' };
+  }
+
+  private async pollPendingLogins(): Promise<void> {
+    const tasks: Promise<void>[] = [];
+    for (const [qqAccount, instance] of this.instances.entries()) {
+      if (!instance.pendingLogin) continue;
+      tasks.push(this.pollPendingLoginStatus(qqAccount, instance));
+    }
+    if (tasks.length === 0) return;
+    await Promise.allSettled(tasks);
+  }
+
+  private async pollPendingLoginStatus(
+    placeholderAccount: string,
+    instance: NapCatInstance,
+  ): Promise<void> {
+    const pendingLogin = instance.pendingLogin;
+    if (!pendingLogin || pendingLogin.cleanupStarted) {
+      return;
+    }
+
+    if (Date.parse(pendingLogin.expiresAt) <= Date.now()) {
+      await this.emitPendingLoginEvent(instance, 'expired');
+      await this.cleanupPendingLogin(placeholderAccount, instance);
+      return;
+    }
+
+    let status: PendingLoginStatusData;
+    try {
+      status = await this.getPendingLoginStatus(instance);
+    } catch {
+      return;
+    }
+
+    const activePendingLogin = instance.pendingLogin;
+    if (!activePendingLogin || activePendingLogin.cleanupStarted) {
+      return;
+    }
+
+    const loginStage = status.loginStage || 'idle';
+    activePendingLogin.lastLoginStage = loginStage;
+
+    if (loginStage === 'qr_ready') {
+      await this.emitPendingLoginEvent(instance, 'qr_ready');
+    }
+
+    if (loginStage === 'scanned') {
+      await this.emitPendingLoginEvent(instance, 'scanned');
+    }
+
+    if (loginStage === 'expired') {
+      await this.emitPendingLoginEvent(instance, 'expired');
+      await this.cleanupPendingLogin(placeholderAccount, instance);
+      return;
+    }
+
+    if (loginStage === 'failed') {
+      await this.emitPendingLoginEvent(instance, 'failed', {
+        reason: status.loginError || '未知错误',
+      });
+      await this.cleanupPendingLogin(placeholderAccount, instance);
+      return;
+    }
+
+    if (status.loginError && !status.isLogin) {
+      await this.emitPendingLoginEvent(instance, 'failed', {
+        reason: status.loginError,
+      });
+      await this.cleanupPendingLogin(placeholderAccount, instance);
+      return;
+    }
+
+    if (status.isLogin || loginStage === 'success') {
+      await this.promotePendingLogin(placeholderAccount, instance);
+    }
+  }
+
+  private async cleanupPendingLogin(
+    placeholderAccount: string,
+    instance: NapCatInstance,
+  ): Promise<void> {
+    const pendingLogin = instance.pendingLogin;
+    if (!pendingLogin || pendingLogin.cleanupStarted) {
+      return;
+    }
+
+    pendingLogin.cleanupStarted = true;
+    instance.status = 'stopped';
+
+    if (this.config.mode === 'docker') {
+      try {
+        await execAsync(`docker stop ${instance.containerName}`);
+      } catch {
+        // Ignore container stop errors during cleanup.
+      }
+
+      try {
+        await execAsync(`docker rm ${instance.containerName}`);
+      } catch {
+        // Ignore container remove errors during cleanup.
+      }
+    }
+
+    this.instances.delete(placeholderAccount);
+
+    if (instance.dataDir) {
+      fs.rmSync(instance.dataDir, { recursive: true, force: true });
+    }
+
+    logger.info(
+      { placeholderAccount, ticketId: pendingLogin.id },
+      'Pending NapCat login session cleaned up',
+    );
   }
 
   private async loginWebUi(
@@ -650,6 +911,11 @@ export class NapCatFleetManager {
     placeholderAccount: string,
     instance: NapCatInstance,
   ): Promise<void> {
+    const pendingLogin = instance.pendingLogin;
+    if (!pendingLogin) {
+      return;
+    }
+
     const info = await instance.connector.getLoginInfo();
     const realAccount = String(info.user_id || '').trim();
     if (!realAccount) {
@@ -667,6 +933,12 @@ export class NapCatFleetManager {
         { realAccount, placeholderAccount },
         'Pending NapCat login resolved to an already connected account',
       );
+      await this.emitPendingLoginEvent(instance, 'failed', {
+        qqAccount: realAccount,
+        nickname: info.nickname || undefined,
+        reason: '该账号已接入',
+      });
+      await this.cleanupPendingLogin(placeholderAccount, instance);
       return;
     }
 
@@ -683,6 +955,11 @@ export class NapCatFleetManager {
     if (!this.config.accounts.some((item) => item.qqAccount === realAccount)) {
       this.config.accounts.push(nextAccount);
     }
+
+    await this.emitPendingLoginEvent(instance, 'success', {
+      qqAccount: realAccount,
+      nickname: info.nickname || undefined,
+    });
 
     this.instances.delete(placeholderAccount);
     this.instances.set(realAccount, {
