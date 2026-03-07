@@ -1,7 +1,8 @@
 import fs from 'fs';
+import http from 'http';
 import path from 'path';
 
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { _initTestDatabase, getRegisteredGroup } from '../db.js';
 import {
@@ -34,13 +35,69 @@ function createConfig(overrides: Partial<QQBridgeConfig> = {}): QQBridgeConfig {
 
 function createOpts() {
   const groups: Record<string, any> = {};
+  const messages: Array<{ chatJid: string; message: any }> = [];
+  const metadata: Array<{
+    chatJid: string;
+    timestamp: string;
+    name?: string;
+    channel?: string;
+    isGroup?: boolean;
+  }> = [];
   return {
     opts: {
-      onMessage: vi.fn(),
-      onChatMetadata: vi.fn(),
+      onMessage: (chatJid: string, message: any) => {
+        messages.push({ chatJid, message });
+      },
+      onChatMetadata: (
+        chatJid: string,
+        timestamp: string,
+        name?: string,
+        channel?: string,
+        isGroup?: boolean,
+      ) => {
+        metadata.push({ chatJid, timestamp, name, channel, isGroup });
+      },
       registeredGroups: () => groups,
     },
     groups,
+    messages,
+    metadata,
+  };
+}
+
+async function startOutboundServer(statuses: number[]): Promise<{
+  url: string;
+  close: () => Promise<void>;
+  getRequestCount: () => number;
+}> {
+  let requestCount = 0;
+  const server = http.createServer((_, response) => {
+    const status = statuses[Math.min(requestCount, statuses.length - 1)] ?? 200;
+    requestCount += 1;
+    response.statusCode = status;
+    response.setHeader('content-type', 'application/json; charset=utf-8');
+    response.end(status >= 400 ? 'error' : '{}');
+  });
+
+  await new Promise<void>((resolve) => {
+    server.listen(0, '127.0.0.1', () => resolve());
+  });
+
+  const address = server.address();
+  if (!address || typeof address === 'string') {
+    throw new Error('Failed to bind outbound test server');
+  }
+
+  return {
+    url: `http://127.0.0.1:${address.port}/outbound`,
+    close: () =>
+      new Promise<void>((resolve, reject) => {
+        server.close((error) => {
+          if (error) reject(error);
+          else resolve();
+        });
+      }),
+    getRequestCount: () => requestCount,
   };
 }
 
@@ -101,41 +158,44 @@ describe('qq-bridge helpers', () => {
 
 describe('OutboundDispatcher', () => {
   it('retries retryable responses before succeeding', async () => {
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValueOnce(new Response('busy', { status: 429 }))
-      .mockResolvedValueOnce(new Response('{}', { status: 200 }));
+    const server = await startOutboundServer([429, 200]);
+    try {
+      const dispatcher = new OutboundDispatcher(
+        createConfig({ outboundUrl: server.url }),
+        fetch,
+      );
 
-    const dispatcher = new OutboundDispatcher(
-      createConfig(),
-      fetchMock as typeof fetch,
-    );
-
-    await dispatcher.enqueue({
-      kind: 'message',
-      jid: 'qq:group:123',
-      text: 'hello',
-    });
-
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-  });
-
-  it('fails immediately on non-retryable response', async () => {
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValue(new Response('bad request', { status: 400 }));
-    const dispatcher = new OutboundDispatcher(
-      createConfig(),
-      fetchMock as typeof fetch,
-    );
-
-    await expect(
-      dispatcher.enqueue({
+      await dispatcher.enqueue({
         kind: 'message',
         jid: 'qq:group:123',
         text: 'hello',
-      }),
-    ).rejects.toThrow('400');
+      });
+
+      expect(server.getRequestCount()).toBe(2);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it('fails immediately on non-retryable response', async () => {
+    const server = await startOutboundServer([400]);
+    try {
+      const dispatcher = new OutboundDispatcher(
+        createConfig({ outboundUrl: server.url }),
+        fetch,
+      );
+
+      await expect(
+        dispatcher.enqueue({
+          kind: 'message',
+          jid: 'qq:group:123',
+          text: 'hello',
+        }),
+      ).rejects.toThrow('400');
+      expect(server.getRequestCount()).toBe(1);
+    } finally {
+      await server.close();
+    }
   });
 });
 
@@ -161,17 +221,14 @@ describe('QQBridgeChannel', () => {
         force: true,
       });
     }
-    vi.restoreAllMocks();
   });
 
   it('auto-registers private chats and stores inbound messages', async () => {
-    const { opts, groups } = createOpts();
+    const { opts, groups, messages } = createOpts();
     const channel = new QQBridgeChannel(
       createConfig(),
       opts,
-      vi
-        .fn()
-        .mockResolvedValue(new Response('{}', { status: 200 })) as typeof fetch,
+      fetch,
     );
 
     await channel.connect();
@@ -199,7 +256,7 @@ describe('QQBridgeChannel', () => {
     expect(body.accepted).toBe(true);
     expect(body.registered).toBe(true);
     expect(groups[toQqJid('private', '1000')]).toBeTruthy();
-    expect(opts.onMessage).toHaveBeenCalledTimes(1);
+    expect(messages).toHaveLength(1);
     expect(
       getRegisteredGroup(toQqJid('private', '1000'))?.requiresTrigger,
     ).toBe(false);
@@ -208,13 +265,11 @@ describe('QQBridgeChannel', () => {
   });
 
   it('drops unregistered group messages by default', async () => {
-    const { opts, groups } = createOpts();
+    const { opts, groups, messages } = createOpts();
     const channel = new QQBridgeChannel(
       createConfig(),
       opts,
-      vi
-        .fn()
-        .mockResolvedValue(new Response('{}', { status: 200 })) as typeof fetch,
+      fetch,
     );
 
     await channel.connect();
@@ -240,7 +295,7 @@ describe('QQBridgeChannel', () => {
     expect(body.accepted).toBe(false);
     expect(body.registered).toBe(false);
     expect(groups[toQqJid('group', '1001')]).toBeUndefined();
-    expect(opts.onMessage).not.toHaveBeenCalled();
+    expect(messages).toHaveLength(0);
 
     await channel.disconnect();
   });
@@ -250,9 +305,7 @@ describe('QQBridgeChannel', () => {
     const channel = new QQBridgeChannel(
       createConfig(),
       opts,
-      vi
-        .fn()
-        .mockResolvedValue(new Response('{}', { status: 200 })) as typeof fetch,
+      fetch,
     );
 
     await channel.connect();
@@ -282,7 +335,7 @@ describe('QQBridgeChannel', () => {
   });
 
   it('handles private add-bot-account command and returns qr ticket', async () => {
-    const { opts } = createOpts();
+    const { opts, messages } = createOpts();
     const channel = new QQBridgeChannel(
       createConfig({ publicBaseUrl: 'https://bot.example.com' }),
       opts,
@@ -348,7 +401,7 @@ describe('QQBridgeChannel', () => {
     expect(response.status).toBe(200);
     expect(body.accepted).toBe(true);
     expect(body.registered).toBe(true);
-    expect(opts.onMessage).not.toHaveBeenCalled();
+    expect(messages).toHaveLength(0);
     expect(privateTexts).toHaveLength(1);
     expect(privateTexts[0]?.userId).toBe('1000');
     expect(privateTexts[0]?.text).toContain('已生成新的机器人登录二维码');
@@ -369,7 +422,7 @@ describe('QQBridgeChannel', () => {
   });
 
   it('only notifies the requesting private chat once per lifecycle state', async () => {
-    const { opts } = createOpts();
+    const { opts, messages } = createOpts();
     const channel = new QQBridgeChannel(
       createConfig({ publicBaseUrl: 'https://bot.example.com' }),
       opts,
@@ -434,6 +487,7 @@ describe('QQBridgeChannel', () => {
     });
 
     expect(response.status).toBe(200);
+    expect(messages).toHaveLength(0);
     expect(privateTexts).toHaveLength(1);
     expect(privateImages).toHaveLength(1);
 
