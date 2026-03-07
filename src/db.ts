@@ -808,9 +808,14 @@ export function createAgentAssignment(assignment: AgentAssignment): void {
 }
 
 export function getAssignmentsForTask(taskId: string): AgentAssignment[] {
-  return db.prepare('SELECT * FROM agent_assignments WHERE task_id = ?').all(taskId) as Array<{
-    id: string; task_id: string; qq_account: string; role_name: string; status: string;
-  }> as unknown as AgentAssignment[];
+  const rows = db.prepare('SELECT * FROM agent_assignments WHERE task_id = ?').all(taskId) as Array<Record<string, unknown>>;
+  return rows.map((row) => ({
+    id: row.id as string,
+    taskId: row.task_id as string,
+    qqAccount: row.qq_account as string,
+    roleName: row.role_name as string,
+    status: row.status as AgentAssignment['status'],
+  }));
 }
 
 export function updateAgentAssignment(id: string, updates: Partial<AgentAssignment>): void {
@@ -926,11 +931,25 @@ export function addDiscussionMessage(msg: DiscussionMessage): void {
   ).run(msg.discussionId, msg.round, msg.senderAccount, msg.senderRole, msg.content, msg.messageType, msg.timestamp);
 }
 
+function mapDiscussionMessageRow(row: Record<string, unknown>): DiscussionMessage {
+  return {
+    id: row.id as number,
+    discussionId: row.discussion_id as string,
+    round: row.round as number,
+    senderAccount: row.sender_account as string,
+    senderRole: row.sender_role as string,
+    content: row.content as string,
+    messageType: row.message_type as DiscussionMessage['messageType'],
+    timestamp: row.timestamp as string,
+  };
+}
+
 export function getDiscussionMessages(discussionId: string, round?: number): DiscussionMessage[] {
   if (round !== undefined) {
-    return db.prepare(
+    const rows = db.prepare(
       'SELECT * FROM discussion_messages WHERE discussion_id = ? AND round = ? ORDER BY id',
-    ).all(discussionId, round) as Array<Record<string, unknown>> as unknown as DiscussionMessage[];
+    ).all(discussionId, round) as Array<Record<string, unknown>>;
+    return rows.map(mapDiscussionMessageRow);
   }
   const rows = db.prepare(
     'SELECT * FROM discussion_messages WHERE discussion_id = ? ORDER BY id',
