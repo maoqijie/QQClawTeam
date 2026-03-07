@@ -752,13 +752,30 @@ async function main(): Promise<void> {
           groupPool.releaseGroup(task.qqGroupId);
         }
 
-        // Send result to user
+        // Save the full MD document to the group workspace
+        const title = task.title || '方案文档';
+        const safeTitle = title.replace(/[^a-zA-Z0-9\u4e00-\u9fff_-]/g, '_').slice(0, 40);
+        const date = new Date().toISOString().split('T')[0];
+        const mdFilename = `${date}-${safeTitle}.md`;
+        const outputDir = path.join(resolveGroupFolderPath('qq_private_523528830'), 'plans');
+        fs.mkdirSync(outputDir, { recursive: true });
+        const mdPath = path.join(outputDir, mdFilename);
+        fs.writeFileSync(mdPath, result);
+        logger.info({ taskId, mdPath }, 'Discussion plan document saved');
+
+        // Send summary to user (truncate if too long for QQ message)
         const channel = findChannel(channels, task.userChatJid);
         if (channel) {
-          await channel.sendMessage(
-            task.userChatJid,
-            `📋 团队任务完成\n\n${result}`,
-          );
+          const maxLen = 3000;
+          if (result.length <= maxLen) {
+            await channel.sendMessage(task.userChatJid, `📋 团队讨论完成，以下是方案文档：\n\n${result}`);
+          } else {
+            // Send in chunks for long documents
+            await channel.sendMessage(task.userChatJid, `📋 团队讨论完成，方案文档较长，分段发送：`);
+            for (let i = 0; i < result.length; i += maxLen) {
+              await channel.sendMessage(task.userChatJid, result.slice(i, i + maxLen));
+            }
+          }
         }
       },
     });

@@ -336,6 +336,7 @@ export class DiscussionEngine {
 
   /**
    * Synthesize the discussion into a final result.
+   * Runs an agent container to produce a comprehensive Markdown plan document.
    */
   private async synthesize(state: DiscussionState): Promise<void> {
     state.phase = 'synthesizing';
@@ -347,11 +348,59 @@ export class DiscussionEngine {
 
     logger.info({ discussionId: state.id }, 'Synthesizing discussion');
 
+    const taskDescription = this.deps.getTaskDescription(state.taskId);
     const allMessages = this.deps.db.getDiscussionMessages(state.id);
     const contributions = allMessages.filter((m) => m.messageType === 'contribution');
+    const history = this.formatDiscussionHistory(state);
 
-    // Build synthesis from all contributions
-    const synthesis = this.buildSynthesis(state, contributions);
+    // Build synthesis prompt for the agent
+    const synthesisPrompt = [
+      '你是一名技术方案整合专家。请基于以下团队讨论记录，输出一份**完整的、可落地的 Markdown 方案文档**。',
+      '',
+      `## 原始需求`,
+      taskDescription,
+      '',
+      `## 讨论记录`,
+      history,
+      '',
+      '## 输出要求',
+      '',
+      '请输出一份结构清晰的 Markdown 文档，包含但不限于：',
+      '1. 项目概述（背景、目标、范围）',
+      '2. 整体架构设计（附文字描述的架构图）',
+      '3. 核心模块设计（每个模块的职责、接口、数据流）',
+      '4. 技术选型（语言、框架、中间件，并说明选择理由）',
+      '5. 数据库设计（核心表结构）',
+      '6. 关键流程设计（用文字描述核心业务流程）',
+      '7. 非功能性需求（性能、安全、可用性）',
+      '8. 实施计划（分期里程碑、优先级）',
+      '9. 风险与应对',
+      '',
+      '要求：',
+      '- 综合所有角色的观点，取长补短',
+      '- 内容要具体、可执行，不要泛泛而谈',
+      '- 直接输出 Markdown 内容，不要加额外说明',
+    ].join('\n');
+
+    let synthesis: string;
+
+    try {
+      synthesis = await Promise.race([
+        this.deps.runAgentTurn(
+          { qqAccount: 'system', roleName: '方案整合', systemPrompt: '你是技术方案整合专家，擅长将多方讨论整合为完整可落地的方案文档。' },
+          taskDescription,
+          synthesisPrompt,
+          0,
+          state.taskId,
+        ),
+        new Promise<string>((_, reject) =>
+          setTimeout(() => reject(new Error('Synthesis timeout')), DISCUSSION_TURN_TIMEOUT * 2),
+        ),
+      ]);
+    } catch (err) {
+      logger.error({ discussionId: state.id, err }, 'Synthesis agent failed, falling back to simple synthesis');
+      synthesis = this.buildSimpleSynthesis(state, contributions);
+    }
 
     // Record synthesis
     this.deps.db.addDiscussionMessage({
@@ -372,9 +421,9 @@ export class DiscussionEngine {
   }
 
   /**
-   * Build a synthesis summary from discussion contributions.
+   * Simple fallback synthesis when agent-based synthesis fails.
    */
-  private buildSynthesis(state: DiscussionState, contributions: DiscussionMessage[]): string {
+  private buildSimpleSynthesis(state: DiscussionState, contributions: DiscussionMessage[]): string {
     const lines: string[] = [
       `📋 讨论综合报告`,
       `任务ID: ${state.taskId}`,
