@@ -88,6 +88,14 @@ export class NapCatConnector {
     return resp.data as { user_id: number; nickname: string };
   }
 
+  async setGroupCard(groupId: string, userId: string, card: string): Promise<OneBotResponse> {
+    return this.callApi('set_group_card', {
+      group_id: Number(groupId),
+      user_id: Number(userId),
+      card,
+    });
+  }
+
   async setGroupName(groupId: string, groupName: string): Promise<OneBotResponse> {
     return this.callApi('set_group_name', {
       group_id: Number(groupId),

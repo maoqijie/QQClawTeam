@@ -63,6 +63,10 @@ export interface DiscussionEngineDeps {
    */
   sendAsAccount: (groupId: string, qqAccount: string, text: string) => Promise<void>;
   /**
+   * Set a bot account's group card (nickname) in a specific group.
+   */
+  setGroupCard: (groupId: string, qqAccount: string, card: string) => Promise<void>;
+  /**
    * Run a short-lived agent container for a single turn.
    * Returns the agent's response text.
    */
@@ -236,9 +240,11 @@ export class DiscussionEngine {
         ),
       ]);
 
-      // Send the response to the QQ group as this agent's account
-      const formattedMsg = `【${participant.roleName}】\n${response}`;
-      await this.deps.sendAsAccount(state.qqGroupId, participant.qqAccount, formattedMsg);
+      // Set the bot's group nickname to the role name before sending
+      await this.deps.setGroupCard(state.qqGroupId, participant.qqAccount, participant.roleName);
+
+      // Send the response directly — the group card already shows the role
+      await this.deps.sendAsAccount(state.qqGroupId, participant.qqAccount, response);
 
       // Record in discussion messages
       this.deps.db.addDiscussionMessage({

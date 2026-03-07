@@ -606,7 +606,12 @@ async function main(): Promise<void> {
         getAssignmentsForTask: dbGetAssignmentsForTask,
         updateAgentAssignment: dbUpdateAgentAssignment,
       },
-      (assigned) => fleetManager!.getAvailableAgentAccounts(assigned),
+      (assigned) => {
+        // Use ALL bot accounts (including main) for discussion role assignment.
+        // sendAsAccount works for any connected NapCat instance regardless of role.
+        const all = Array.from(fleetManager!.getAllBotAccounts());
+        return all.filter((a) => !assigned.has(a));
+      },
     );
 
     // Initialize discussion engine
@@ -624,6 +629,14 @@ async function main(): Promise<void> {
       sendAsAccount: async (groupId, qqAccount, text) => {
         if (qqBridge) {
           await qqBridge.sendAsAccount(groupId, qqAccount, text);
+        }
+      },
+      setGroupCard: async (groupId, qqAccount, card) => {
+        if (fleetManager) {
+          const connector = fleetManager.getConnector(qqAccount);
+          if (connector) {
+            await connector.setGroupCard(groupId, qqAccount, card);
+          }
         }
       },
       runAgentTurn: async (participant, taskDescription, history, round, taskId) => {
