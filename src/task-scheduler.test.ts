@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { _initTestDatabase, createTask, getTaskById } from './db.js';
 import {
@@ -7,15 +7,18 @@ import {
   startSchedulerLoop,
 } from './task-scheduler.js';
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 describe('task scheduler', () => {
   beforeEach(() => {
     _initTestDatabase();
     _resetSchedulerLoopForTests();
-    vi.useFakeTimers();
   });
 
   afterEach(() => {
-    vi.useRealTimers();
+    _resetSchedulerLoopForTests();
   });
 
   it('pauses due tasks with invalid group folders to prevent retry churn', async () => {
@@ -32,35 +35,46 @@ describe('task scheduler', () => {
       created_at: '2026-02-22T00:00:00.000Z',
     });
 
-    const enqueueTask = vi.fn(
-      (_groupJid: string, _taskId: string, fn: () => Promise<void>) => {
-        void fn();
+    const queueCalls: string[] = [];
+
+    startSchedulerLoop(
+      {
+        registeredGroups: () => ({}),
+        getSessions: () => ({}),
+        queue: {
+          enqueueTask: (
+            _groupJid: string,
+            taskId: string,
+            fn: () => Promise<void>,
+          ) => {
+            queueCalls.push(taskId);
+            void fn();
+          },
+          closeStdin: () => undefined,
+          notifyIdle: () => undefined,
+        } as any,
+        onProcess: () => undefined,
+        sendMessage: async () => undefined,
       },
+      { pollIntervalMs: 5 },
     );
 
-    startSchedulerLoop({
-      registeredGroups: () => ({}),
-      getSessions: () => ({}),
-      queue: { enqueueTask } as any,
-      onProcess: () => {},
-      sendMessage: async () => {},
-    });
-
-    await vi.advanceTimersByTimeAsync(10);
+    await sleep(20);
 
     const task = getTaskById('task-invalid-folder');
+    expect(queueCalls).toContain('task-invalid-folder');
     expect(task?.status).toBe('paused');
   });
 
   it('computeNextRun anchors interval tasks to scheduled time to prevent drift', () => {
-    const scheduledTime = new Date(Date.now() - 2000).toISOString(); // 2s ago
+    const scheduledTime = new Date(Date.now() - 2000).toISOString();
     const task = {
       id: 'drift-test',
       group_folder: 'test',
       chat_jid: 'test@g.us',
       prompt: 'test',
       schedule_type: 'interval' as const,
-      schedule_value: '60000', // 1 minute
+      schedule_value: '60000',
       context_mode: 'isolated' as const,
       next_run: scheduledTime,
       last_run: null,
@@ -69,15 +83,14 @@ describe('task scheduler', () => {
       created_at: '2026-01-01T00:00:00.000Z',
     };
 
-    const nextRun = computeNextRun(task);
+    const nextRun = computeNextRun(task as any);
     expect(nextRun).not.toBeNull();
 
-    // Should be anchored to scheduledTime + 60s, NOT Date.now() + 60s
     const expected = new Date(scheduledTime).getTime() + 60000;
     expect(new Date(nextRun!).getTime()).toBe(expected);
   });
 
-  it('computeNextRun returns null for once-tasks', () => {
+  it('computeNextRun returns null for once tasks', () => {
     const task = {
       id: 'once-test',
       group_folder: 'test',
@@ -93,15 +106,12 @@ describe('task scheduler', () => {
       created_at: '2026-01-01T00:00:00.000Z',
     };
 
-    expect(computeNextRun(task)).toBeNull();
+    expect(computeNextRun(task as any)).toBeNull();
   });
 
   it('computeNextRun skips missed intervals without infinite loop', () => {
-    // Task was due 10 intervals ago (missed)
     const ms = 60000;
-    const missedBy = ms * 10;
-    const scheduledTime = new Date(Date.now() - missedBy).toISOString();
-
+    const scheduledTime = new Date(Date.now() - ms * 10).toISOString();
     const task = {
       id: 'skip-test',
       group_folder: 'test',
@@ -117,11 +127,9 @@ describe('task scheduler', () => {
       created_at: '2026-01-01T00:00:00.000Z',
     };
 
-    const nextRun = computeNextRun(task);
+    const nextRun = computeNextRun(task as any);
     expect(nextRun).not.toBeNull();
-    // Must be in the future
     expect(new Date(nextRun!).getTime()).toBeGreaterThan(Date.now());
-    // Must be aligned to the original schedule grid
     const offset =
       (new Date(nextRun!).getTime() - new Date(scheduledTime).getTime()) % ms;
     expect(offset).toBe(0);

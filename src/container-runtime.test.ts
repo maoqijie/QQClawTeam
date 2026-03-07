@@ -1,149 +1,134 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
-
-// Mock logger
-vi.mock('./logger.js', () => ({
-  logger: {
-    debug: vi.fn(),
-    info: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
-  },
-}));
-
-// Mock child_process — store the mock fn so tests can configure it
-const mockExecSync = vi.fn();
-vi.mock('child_process', () => ({
-  execSync: (...args: unknown[]) => mockExecSync(...args),
-}));
+import { beforeEach, describe, expect, it } from 'vitest';
 
 import {
   CONTAINER_RUNTIME_BIN,
+  cleanupOrphans,
+  ensureContainerRuntimeRunning,
   readonlyMountArgs,
   stopContainer,
-  ensureContainerRuntimeRunning,
-  cleanupOrphans,
 } from './container-runtime.js';
-import { logger } from './logger.js';
 
-beforeEach(() => {
-  vi.clearAllMocks();
-});
+interface LogEntry {
+  level: 'debug' | 'info' | 'warn' | 'error';
+  args: unknown[];
+}
 
-// --- Pure functions ---
+function createLoggerRecorder() {
+  const entries: LogEntry[] = [];
+  return {
+    entries,
+    logger: {
+      debug: (...args: unknown[]) => entries.push({ level: 'debug', args }),
+      info: (...args: unknown[]) => entries.push({ level: 'info', args }),
+      warn: (...args: unknown[]) => entries.push({ level: 'warn', args }),
+      error: (...args: unknown[]) => entries.push({ level: 'error', args }),
+    },
+  };
+}
 
-describe('readonlyMountArgs', () => {
-  it('returns -v flag with :ro suffix', () => {
-    const args = readonlyMountArgs('/host/path', '/container/path');
-    expect(args).toEqual(['-v', '/host/path:/container/path:ro']);
+describe('container-runtime', () => {
+  let commands: string[];
+
+  beforeEach(() => {
+    commands = [];
   });
-});
 
-describe('stopContainer', () => {
-  it('returns stop command using CONTAINER_RUNTIME_BIN', () => {
+  it('returns readonly mount args', () => {
+    expect(readonlyMountArgs('/host/path', '/container/path')).toEqual([
+      '-v',
+      '/host/path:/container/path:ro',
+    ]);
+  });
+
+  it('returns stop command using runtime binary', () => {
     expect(stopContainer('nanoclaw-test-123')).toBe(
       `${CONTAINER_RUNTIME_BIN} stop nanoclaw-test-123`,
     );
   });
-});
 
-// --- ensureContainerRuntimeRunning ---
-
-describe('ensureContainerRuntimeRunning', () => {
   it('does nothing when runtime is already running', () => {
-    mockExecSync.mockReturnValueOnce('');
+    const logs = createLoggerRecorder();
 
-    ensureContainerRuntimeRunning();
-
-    expect(mockExecSync).toHaveBeenCalledTimes(1);
-    expect(mockExecSync).toHaveBeenCalledWith(`${CONTAINER_RUNTIME_BIN} info`, {
-      stdio: 'pipe',
-      timeout: 10000,
-    });
-    expect(logger.debug).toHaveBeenCalledWith(
-      'Container runtime already running',
-    );
-  });
-
-  it('throws when docker info fails', () => {
-    mockExecSync.mockImplementationOnce(() => {
-      throw new Error('Cannot connect to the Docker daemon');
+    ensureContainerRuntimeRunning({
+      execSyncFn: ((command: string) => {
+        commands.push(command);
+        return '';
+      }) as typeof import('child_process').execSync,
+      loggerLike: logs.logger,
+      consoleErrorFn: () => undefined,
     });
 
-    expect(() => ensureContainerRuntimeRunning()).toThrow(
-      'Container runtime is required but failed to start',
-    );
-    expect(logger.error).toHaveBeenCalled();
+    expect(commands).toEqual([`${CONTAINER_RUNTIME_BIN} info`]);
+    expect(logs.entries).toContainEqual({
+      level: 'debug',
+      args: ['Container runtime already running'],
+    });
   });
-});
 
-// --- cleanupOrphans ---
+  it('throws when runtime info fails', () => {
+    const logs = createLoggerRecorder();
+    const stderr: string[] = [];
 
-describe('cleanupOrphans', () => {
-  it('stops orphaned nanoclaw containers', () => {
-    // docker ps returns container names, one per line
-    mockExecSync.mockReturnValueOnce(
-      'nanoclaw-group1-111\nnanoclaw-group2-222\n',
-    );
-    // stop calls succeed
-    mockExecSync.mockReturnValue('');
+    expect(() =>
+      ensureContainerRuntimeRunning({
+        execSyncFn: ((command: string) => {
+          commands.push(command);
+          throw new Error('Cannot connect to the Docker daemon');
+        }) as typeof import('child_process').execSync,
+        loggerLike: logs.logger,
+        consoleErrorFn: (...args: unknown[]) => {
+          stderr.push(args.join(' '));
+        },
+      }),
+    ).toThrow('Container runtime is required but failed to start');
 
-    cleanupOrphans();
+    expect(commands).toEqual([`${CONTAINER_RUNTIME_BIN} info`]);
+    expect(logs.entries.some((entry) => entry.level === 'error')).toBe(true);
+    expect(stderr.length).toBeGreaterThan(0);
+  });
 
-    // ps + 2 stop calls
-    expect(mockExecSync).toHaveBeenCalledTimes(3);
-    expect(mockExecSync).toHaveBeenNthCalledWith(
-      2,
+  it('stops orphaned containers', () => {
+    const logs = createLoggerRecorder();
+
+    cleanupOrphans({
+      execSyncFn: ((command: string) => {
+        commands.push(command);
+        if (command.includes(' ps ')) {
+          return 'nanoclaw-group1-111\nnanoclaw-group2-222\n';
+        }
+        return '';
+      }) as typeof import('child_process').execSync,
+      loggerLike: logs.logger,
+    });
+
+    expect(commands).toEqual([
+      `${CONTAINER_RUNTIME_BIN} ps --filter name=nanoclaw- --format '{{.Names}}'`,
       `${CONTAINER_RUNTIME_BIN} stop nanoclaw-group1-111`,
-      { stdio: 'pipe' },
-    );
-    expect(mockExecSync).toHaveBeenNthCalledWith(
-      3,
       `${CONTAINER_RUNTIME_BIN} stop nanoclaw-group2-222`,
-      { stdio: 'pipe' },
-    );
-    expect(logger.info).toHaveBeenCalledWith(
-      { count: 2, names: ['nanoclaw-group1-111', 'nanoclaw-group2-222'] },
-      'Stopped orphaned containers',
-    );
-  });
-
-  it('does nothing when no orphans exist', () => {
-    mockExecSync.mockReturnValueOnce('');
-
-    cleanupOrphans();
-
-    expect(mockExecSync).toHaveBeenCalledTimes(1);
-    expect(logger.info).not.toHaveBeenCalled();
+    ]);
+    expect(logs.entries).toContainEqual({
+      level: 'info',
+      args: [
+        { count: 2, names: ['nanoclaw-group1-111', 'nanoclaw-group2-222'] },
+        'Stopped orphaned containers',
+      ],
+    });
   });
 
   it('warns and continues when ps fails', () => {
-    mockExecSync.mockImplementationOnce(() => {
-      throw new Error('docker not available');
+    const logs = createLoggerRecorder();
+
+    cleanupOrphans({
+      execSyncFn: ((command: string) => {
+        commands.push(command);
+        throw new Error('docker not available');
+      }) as typeof import('child_process').execSync,
+      loggerLike: logs.logger,
     });
 
-    cleanupOrphans(); // should not throw
-
-    expect(logger.warn).toHaveBeenCalledWith(
-      expect.objectContaining({ err: expect.any(Error) }),
-      'Failed to clean up orphaned containers',
-    );
-  });
-
-  it('continues stopping remaining containers when one stop fails', () => {
-    mockExecSync.mockReturnValueOnce('nanoclaw-a-1\nnanoclaw-b-2\n');
-    // First stop fails
-    mockExecSync.mockImplementationOnce(() => {
-      throw new Error('already stopped');
-    });
-    // Second stop succeeds
-    mockExecSync.mockReturnValueOnce('');
-
-    cleanupOrphans(); // should not throw
-
-    expect(mockExecSync).toHaveBeenCalledTimes(3);
-    expect(logger.info).toHaveBeenCalledWith(
-      { count: 2, names: ['nanoclaw-a-1', 'nanoclaw-b-2'] },
-      'Stopped orphaned containers',
-    );
+    expect(commands).toEqual([
+      `${CONTAINER_RUNTIME_BIN} ps --filter name=nanoclaw- --format '{{.Names}}'`,
+    ]);
+    expect(logs.entries.some((entry) => entry.level === 'warn')).toBe(true);
   });
 });

@@ -1,92 +1,32 @@
-import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
 import { EventEmitter } from 'events';
+import fs from 'fs';
+import path from 'path';
 import { PassThrough } from 'stream';
 
-// Sentinel markers must match container-runner.ts
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+
+import { DATA_DIR, GROUPS_DIR } from './config.js';
+import {
+  type ContainerOutput,
+  runContainerAgent,
+} from './container-runner.js';
+import type { RegisteredGroup } from './types.js';
+
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
 const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
 
-// Mock config
-vi.mock('./config.js', () => ({
-  CONTAINER_IMAGE: 'nanoclaw-agent:latest',
-  CONTAINER_MAX_OUTPUT_SIZE: 10485760,
-  CONTAINER_TIMEOUT: 1800000, // 30min
-  DATA_DIR: '/tmp/nanoclaw-test-data',
-  GROUPS_DIR: '/tmp/nanoclaw-test-groups',
-  IDLE_TIMEOUT: 1800000, // 30min
-  TIMEZONE: 'America/Los_Angeles',
-}));
+class FakeChildProcess extends EventEmitter {
+  stdin = new PassThrough();
+  stdout = new PassThrough();
+  stderr = new PassThrough();
+  killed = false;
+  pid = 12345;
 
-// Mock logger
-vi.mock('./logger.js', () => ({
-  logger: {
-    debug: vi.fn(),
-    info: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
-  },
-}));
-
-// Mock fs
-vi.mock('fs', async () => {
-  const actual = await vi.importActual<typeof import('fs')>('fs');
-  return {
-    ...actual,
-    default: {
-      ...actual,
-      existsSync: vi.fn(() => false),
-      mkdirSync: vi.fn(),
-      writeFileSync: vi.fn(),
-      readFileSync: vi.fn(() => ''),
-      readdirSync: vi.fn(() => []),
-      statSync: vi.fn(() => ({ isDirectory: () => false })),
-      copyFileSync: vi.fn(),
-    },
-  };
-});
-
-// Mock mount-security
-vi.mock('./mount-security.js', () => ({
-  validateAdditionalMounts: vi.fn(() => []),
-}));
-
-// Create a controllable fake ChildProcess
-function createFakeProcess() {
-  const proc = new EventEmitter() as EventEmitter & {
-    stdin: PassThrough;
-    stdout: PassThrough;
-    stderr: PassThrough;
-    kill: ReturnType<typeof vi.fn>;
-    pid: number;
-  };
-  proc.stdin = new PassThrough();
-  proc.stdout = new PassThrough();
-  proc.stderr = new PassThrough();
-  proc.kill = vi.fn();
-  proc.pid = 12345;
-  return proc;
+  kill(): boolean {
+    this.killed = true;
+    return true;
+  }
 }
-
-let fakeProc: ReturnType<typeof createFakeProcess>;
-
-// Mock child_process.spawn
-vi.mock('child_process', async () => {
-  const actual =
-    await vi.importActual<typeof import('child_process')>('child_process');
-  return {
-    ...actual,
-    spawn: vi.fn(() => fakeProc),
-    exec: vi.fn(
-      (_cmd: string, _opts: unknown, cb?: (err: Error | null) => void) => {
-        if (cb) cb(null);
-        return new EventEmitter();
-      },
-    ),
-  };
-});
-
-import { runContainerAgent, ContainerOutput } from './container-runner.js';
-import type { RegisteredGroup } from './types.js';
 
 const testGroup: RegisteredGroup = {
   name: 'Test Group',
@@ -102,108 +42,150 @@ const testInput = {
   isMain: false,
 };
 
-function emitOutputMarker(
-  proc: ReturnType<typeof createFakeProcess>,
-  output: ContainerOutput,
-) {
+function emitOutputMarker(proc: FakeChildProcess, output: ContainerOutput) {
   const json = JSON.stringify(output);
   proc.stdout.push(`${OUTPUT_START_MARKER}\n${json}\n${OUTPUT_END_MARKER}\n`);
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 describe('container-runner timeout behavior', () => {
+  const pathsToClean = [
+    path.join(GROUPS_DIR, 'test-group'),
+    path.join(DATA_DIR, 'sessions', 'test-group'),
+    path.join(DATA_DIR, 'ipc', 'test-group'),
+  ];
+
   beforeEach(() => {
-    vi.useFakeTimers();
-    fakeProc = createFakeProcess();
+    for (const target of pathsToClean) {
+      fs.rmSync(target, { recursive: true, force: true });
+    }
   });
 
   afterEach(() => {
-    vi.useRealTimers();
+    for (const target of pathsToClean) {
+      fs.rmSync(target, { recursive: true, force: true });
+    }
   });
 
   it('timeout after output resolves as success', async () => {
-    const onOutput = vi.fn(async () => {});
+    const proc = new FakeChildProcess();
+    const streamed: ContainerOutput[] = [];
+
     const resultPromise = runContainerAgent(
       testGroup,
-      testInput,
-      () => {},
-      onOutput,
+      { ...testInput },
+      () => undefined,
+      async (output) => {
+        streamed.push(output);
+      },
+      {
+        spawnFn: (() => proc) as unknown as typeof import('child_process').spawn,
+        execFn: ((
+          _command: string,
+          _options: unknown,
+          callback?: (error: Error | null) => void,
+        ) => {
+          callback?.(null);
+          return new EventEmitter() as never;
+        }) as unknown as typeof import('child_process').exec,
+        timeoutMs: 50,
+      },
     );
 
-    // Emit output with a result
-    emitOutputMarker(fakeProc, {
+    emitOutputMarker(proc, {
       status: 'success',
       result: 'Here is my response',
       newSessionId: 'session-123',
     });
 
-    // Let output processing settle
-    await vi.advanceTimersByTimeAsync(10);
-
-    // Fire the hard timeout (IDLE_TIMEOUT + 30s = 1830000ms)
-    await vi.advanceTimersByTimeAsync(1830000);
-
-    // Emit close event (as if container was stopped by the timeout)
-    fakeProc.emit('close', 137);
-
-    // Let the promise resolve
-    await vi.advanceTimersByTimeAsync(10);
+    await sleep(10);
+    await sleep(80);
+    proc.emit('close', 137);
 
     const result = await resultPromise;
     expect(result.status).toBe('success');
     expect(result.newSessionId).toBe('session-123');
-    expect(onOutput).toHaveBeenCalledWith(
+    expect(streamed).toContainEqual(
       expect.objectContaining({ result: 'Here is my response' }),
     );
   });
 
   it('timeout with no output resolves as error', async () => {
-    const onOutput = vi.fn(async () => {});
+    const proc = new FakeChildProcess();
+    const streamed: ContainerOutput[] = [];
+
     const resultPromise = runContainerAgent(
       testGroup,
-      testInput,
-      () => {},
-      onOutput,
+      { ...testInput },
+      () => undefined,
+      async (output) => {
+        streamed.push(output);
+      },
+      {
+        spawnFn: (() => proc) as unknown as typeof import('child_process').spawn,
+        execFn: ((
+          _command: string,
+          _options: unknown,
+          callback?: (error: Error | null) => void,
+        ) => {
+          callback?.(null);
+          return new EventEmitter() as never;
+        }) as unknown as typeof import('child_process').exec,
+        timeoutMs: 50,
+      },
     );
 
-    // No output emitted — fire the hard timeout
-    await vi.advanceTimersByTimeAsync(1830000);
-
-    // Emit close event
-    fakeProc.emit('close', 137);
-
-    await vi.advanceTimersByTimeAsync(10);
+    await sleep(80);
+    proc.emit('close', 137);
 
     const result = await resultPromise;
     expect(result.status).toBe('error');
     expect(result.error).toContain('timed out');
-    expect(onOutput).not.toHaveBeenCalled();
+    expect(streamed).toHaveLength(0);
   });
 
   it('normal exit after output resolves as success', async () => {
-    const onOutput = vi.fn(async () => {});
+    const proc = new FakeChildProcess();
+    const streamed: ContainerOutput[] = [];
+
     const resultPromise = runContainerAgent(
       testGroup,
-      testInput,
-      () => {},
-      onOutput,
+      { ...testInput },
+      () => undefined,
+      async (output) => {
+        streamed.push(output);
+      },
+      {
+        spawnFn: (() => proc) as unknown as typeof import('child_process').spawn,
+        execFn: ((
+          _command: string,
+          _options: unknown,
+          callback?: (error: Error | null) => void,
+        ) => {
+          callback?.(null);
+          return new EventEmitter() as never;
+        }) as unknown as typeof import('child_process').exec,
+        timeoutMs: 500,
+      },
     );
 
-    // Emit output
-    emitOutputMarker(fakeProc, {
+    emitOutputMarker(proc, {
       status: 'success',
       result: 'Done',
       newSessionId: 'session-456',
     });
 
-    await vi.advanceTimersByTimeAsync(10);
-
-    // Normal exit (no timeout)
-    fakeProc.emit('close', 0);
-
-    await vi.advanceTimersByTimeAsync(10);
+    await sleep(10);
+    proc.emit('close', 0);
 
     const result = await resultPromise;
     expect(result.status).toBe('success');
     expect(result.newSessionId).toBe('session-456');
+    expect(streamed).toContainEqual(
+      expect.objectContaining({ result: 'Done' }),
+    );
   });
 });

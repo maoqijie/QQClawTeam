@@ -27,6 +27,14 @@ interface GroupState {
   retryCount: number;
 }
 
+export interface GroupQueueOptions {
+  dataDir?: string;
+  maxConcurrentContainers?: number;
+  maxRetries?: number;
+  baseRetryMs?: number;
+  setTimeoutFn?: typeof setTimeout;
+}
+
 export class GroupQueue {
   private groups = new Map<string, GroupState>();
   private activeCount = 0;
@@ -34,6 +42,20 @@ export class GroupQueue {
   private processMessagesFn: ((groupJid: string) => Promise<boolean>) | null =
     null;
   private shuttingDown = false;
+  private readonly dataDir: string;
+  private readonly maxConcurrentContainers: number;
+  private readonly maxRetries: number;
+  private readonly baseRetryMs: number;
+  private readonly setTimeoutFn: typeof setTimeout;
+
+  constructor(options: GroupQueueOptions = {}) {
+    this.dataDir = options.dataDir || DATA_DIR;
+    this.maxConcurrentContainers =
+      options.maxConcurrentContainers || MAX_CONCURRENT_CONTAINERS;
+    this.maxRetries = options.maxRetries || MAX_RETRIES;
+    this.baseRetryMs = options.baseRetryMs || BASE_RETRY_MS;
+    this.setTimeoutFn = options.setTimeoutFn || setTimeout;
+  }
 
   private getGroup(groupJid: string): GroupState {
     let state = this.groups.get(groupJid);
@@ -70,7 +92,7 @@ export class GroupQueue {
       return;
     }
 
-    if (this.activeCount >= MAX_CONCURRENT_CONTAINERS) {
+    if (this.activeCount >= this.maxConcurrentContainers) {
       state.pendingMessages = true;
       if (!this.waitingGroups.includes(groupJid)) {
         this.waitingGroups.push(groupJid);
@@ -111,7 +133,7 @@ export class GroupQueue {
       return;
     }
 
-    if (this.activeCount >= MAX_CONCURRENT_CONTAINERS) {
+    if (this.activeCount >= this.maxConcurrentContainers) {
       state.pendingTasks.push({ id: taskId, groupJid, fn });
       if (!this.waitingGroups.includes(groupJid)) {
         this.waitingGroups.push(groupJid);
@@ -163,7 +185,7 @@ export class GroupQueue {
       return false;
     state.idleWaiting = false; // Agent is about to receive work, no longer idle
 
-    const inputDir = path.join(DATA_DIR, 'ipc', state.groupFolder, 'input');
+    const inputDir = path.join(this.dataDir, 'ipc', state.groupFolder, 'input');
     try {
       fs.mkdirSync(inputDir, { recursive: true });
       const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 6)}.json`;
@@ -184,7 +206,7 @@ export class GroupQueue {
     const state = this.getGroup(groupJid);
     if (!state.active || !state.groupFolder) return;
 
-    const inputDir = path.join(DATA_DIR, 'ipc', state.groupFolder, 'input');
+    const inputDir = path.join(this.dataDir, 'ipc', state.groupFolder, 'input');
     try {
       fs.mkdirSync(inputDir, { recursive: true });
       fs.writeFileSync(path.join(inputDir, '_close'), '');
@@ -262,7 +284,7 @@ export class GroupQueue {
 
   private scheduleRetry(groupJid: string, state: GroupState): void {
     state.retryCount++;
-    if (state.retryCount > MAX_RETRIES) {
+    if (state.retryCount > this.maxRetries) {
       logger.error(
         { groupJid, retryCount: state.retryCount },
         'Max retries exceeded, dropping messages (will retry on next incoming message)',
@@ -271,12 +293,12 @@ export class GroupQueue {
       return;
     }
 
-    const delayMs = BASE_RETRY_MS * Math.pow(2, state.retryCount - 1);
+    const delayMs = this.baseRetryMs * Math.pow(2, state.retryCount - 1);
     logger.info(
       { groupJid, retryCount: state.retryCount, delayMs },
       'Scheduling retry with backoff',
     );
-    setTimeout(() => {
+    this.setTimeoutFn(() => {
       if (!this.shuttingDown) {
         this.enqueueMessageCheck(groupJid);
       }
@@ -318,7 +340,7 @@ export class GroupQueue {
   private drainWaiting(): void {
     while (
       this.waitingGroups.length > 0 &&
-      this.activeCount < MAX_CONCURRENT_CONTAINERS
+      this.activeCount < this.maxConcurrentContainers
     ) {
       const nextJid = this.waitingGroups.shift()!;
       const state = this.getGroup(nextJid);

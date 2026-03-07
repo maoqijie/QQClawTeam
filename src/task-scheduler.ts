@@ -75,6 +75,12 @@ export interface SchedulerDependencies {
   sendMessage: (jid: string, text: string) => Promise<void>;
 }
 
+export interface SchedulerLoopOptions {
+  pollIntervalMs?: number;
+  setTimeoutFn?: typeof setTimeout;
+  clearTimeoutFn?: typeof clearTimeout;
+}
+
 async function runTask(
   task: ScheduledTask,
   deps: SchedulerDependencies,
@@ -238,14 +244,21 @@ async function runTask(
 }
 
 let schedulerRunning = false;
+let schedulerTimer: ReturnType<typeof setTimeout> | null = null;
 
-export function startSchedulerLoop(deps: SchedulerDependencies): void {
+export function startSchedulerLoop(
+  deps: SchedulerDependencies,
+  options: SchedulerLoopOptions = {},
+): void {
   if (schedulerRunning) {
     logger.debug('Scheduler loop already running, skipping duplicate start');
     return;
   }
   schedulerRunning = true;
   logger.info('Scheduler loop started');
+
+  const pollIntervalMs = options.pollIntervalMs || SCHEDULER_POLL_INTERVAL;
+  const setTimeoutFn = options.setTimeoutFn || setTimeout;
 
   const loop = async () => {
     try {
@@ -269,7 +282,7 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
       logger.error({ err }, 'Error in scheduler loop');
     }
 
-    setTimeout(loop, SCHEDULER_POLL_INTERVAL);
+    schedulerTimer = setTimeoutFn(loop, pollIntervalMs);
   };
 
   loop();
@@ -278,4 +291,8 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
 /** @internal - for tests only. */
 export function _resetSchedulerLoopForTests(): void {
   schedulerRunning = false;
+  if (schedulerTimer) {
+    clearTimeout(schedulerTimer);
+    schedulerTimer = null;
+  }
 }

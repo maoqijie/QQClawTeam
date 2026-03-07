@@ -51,6 +51,15 @@ export interface ContainerOutput {
   error?: string;
 }
 
+export interface ContainerRunnerDeps {
+  spawnFn?: typeof spawn;
+  execFn?: typeof exec;
+  setTimeoutFn?: typeof setTimeout;
+  clearTimeoutFn?: typeof clearTimeout;
+  nowFn?: () => number;
+  timeoutMs?: number;
+}
+
 interface VolumeMount {
   hostPath: string;
   containerPath: string;
@@ -288,8 +297,14 @@ export async function runContainerAgent(
   input: ContainerInput,
   onProcess: (proc: ChildProcess, containerName: string) => void,
   onOutput?: (output: ContainerOutput) => Promise<void>,
+  deps: ContainerRunnerDeps = {},
 ): Promise<ContainerOutput> {
-  const startTime = Date.now();
+  const spawnFn = deps.spawnFn || spawn;
+  const execFn = deps.execFn || exec;
+  const setTimeoutFn = deps.setTimeoutFn || setTimeout;
+  const clearTimeoutFn = deps.clearTimeoutFn || clearTimeout;
+  const nowFn = deps.nowFn || Date.now;
+  const startTime = nowFn();
 
   const groupDir = resolveGroupFolderPath(group.folder);
   fs.mkdirSync(groupDir, { recursive: true });
@@ -326,7 +341,7 @@ export async function runContainerAgent(
   fs.mkdirSync(logsDir, { recursive: true });
 
   return new Promise((resolve) => {
-    const container = spawn(CONTAINER_RUNTIME_BIN, containerArgs, {
+    const container = spawnFn(CONTAINER_RUNTIME_BIN, containerArgs, {
       stdio: ['pipe', 'pipe', 'pipe'],
     });
 
@@ -428,7 +443,8 @@ export async function runContainerAgent(
     const configTimeout = group.containerConfig?.timeout || CONTAINER_TIMEOUT;
     // Grace period: hard timeout must be at least IDLE_TIMEOUT + 30s so the
     // graceful _close sentinel has time to trigger before the hard kill fires.
-    const timeoutMs = Math.max(configTimeout, IDLE_TIMEOUT + 30_000);
+    const timeoutMs =
+      deps.timeoutMs || Math.max(configTimeout, IDLE_TIMEOUT + 30_000);
 
     const killOnTimeout = () => {
       timedOut = true;
@@ -436,7 +452,7 @@ export async function runContainerAgent(
         { group: group.name, containerName },
         'Container timeout, stopping gracefully',
       );
-      exec(stopContainer(containerName), { timeout: 15000 }, (err) => {
+      execFn(stopContainer(containerName), { timeout: 15000 }, (err) => {
         if (err) {
           logger.warn(
             { group: group.name, containerName, err },
@@ -447,17 +463,17 @@ export async function runContainerAgent(
       });
     };
 
-    let timeout = setTimeout(killOnTimeout, timeoutMs);
+    let timeout = setTimeoutFn(killOnTimeout, timeoutMs);
 
     // Reset the timeout whenever there's activity (streaming output)
     const resetTimeout = () => {
-      clearTimeout(timeout);
-      timeout = setTimeout(killOnTimeout, timeoutMs);
+      clearTimeoutFn(timeout);
+      timeout = setTimeoutFn(killOnTimeout, timeoutMs);
     };
 
     container.on('close', (code) => {
-      clearTimeout(timeout);
-      const duration = Date.now() - startTime;
+      clearTimeoutFn(timeout);
+      const duration = nowFn() - startTime;
 
       if (timedOut) {
         const ts = new Date().toISOString().replace(/[:.]/g, '-');
@@ -651,7 +667,7 @@ export async function runContainerAgent(
     });
 
     container.on('error', (err) => {
-      clearTimeout(timeout);
+      clearTimeoutFn(timeout);
       logger.error(
         { group: group.name, containerName, error: err },
         'Container spawn error',

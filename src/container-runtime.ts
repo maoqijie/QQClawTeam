@@ -22,38 +22,49 @@ export function stopContainer(name: string): string {
   return `${CONTAINER_RUNTIME_BIN} stop ${name}`;
 }
 
+export interface ContainerRuntimeDeps {
+  execSyncFn?: typeof execSync;
+  loggerLike?: Pick<typeof logger, 'debug' | 'info' | 'warn' | 'error'>;
+  consoleErrorFn?: typeof console.error;
+}
+
 /** Ensure the container runtime is running, starting it if needed. */
-export function ensureContainerRuntimeRunning(): void {
+export function ensureContainerRuntimeRunning(
+  deps: ContainerRuntimeDeps = {},
+): void {
+  const execSyncFn = deps.execSyncFn || execSync;
+  const loggerLike = deps.loggerLike || logger;
+  const consoleErrorFn = deps.consoleErrorFn || console.error;
   try {
-    execSync(`${CONTAINER_RUNTIME_BIN} info`, {
+    execSyncFn(`${CONTAINER_RUNTIME_BIN} info`, {
       stdio: 'pipe',
       timeout: 10000,
     });
-    logger.debug('Container runtime already running');
+    loggerLike.debug('Container runtime already running');
   } catch (err) {
-    logger.error({ err }, 'Failed to reach container runtime');
-    console.error(
+    loggerLike.error({ err }, 'Failed to reach container runtime');
+    consoleErrorFn(
       '\n╔════════════════════════════════════════════════════════════════╗',
     );
-    console.error(
+    consoleErrorFn(
       '║  FATAL: Container runtime failed to start                      ║',
     );
-    console.error(
+    consoleErrorFn(
       '║                                                                ║',
     );
-    console.error(
+    consoleErrorFn(
       '║  Agents cannot run without a container runtime. To fix:        ║',
     );
-    console.error(
+    consoleErrorFn(
       '║  1. Ensure Docker is installed and running                     ║',
     );
-    console.error(
+    consoleErrorFn(
       '║  2. Run: docker info                                           ║',
     );
-    console.error(
+    consoleErrorFn(
       '║  3. Restart NanoClaw                                           ║',
     );
-    console.error(
+    consoleErrorFn(
       '╚════════════════════════════════════════════════════════════════╝\n',
     );
     throw new Error('Container runtime is required but failed to start');
@@ -61,27 +72,29 @@ export function ensureContainerRuntimeRunning(): void {
 }
 
 /** Kill orphaned NanoClaw containers from previous runs. */
-export function cleanupOrphans(): void {
+export function cleanupOrphans(deps: ContainerRuntimeDeps = {}): void {
+  const execSyncFn = deps.execSyncFn || execSync;
+  const loggerLike = deps.loggerLike || logger;
   try {
-    const output = execSync(
+    const output = execSyncFn(
       `${CONTAINER_RUNTIME_BIN} ps --filter name=nanoclaw- --format '{{.Names}}'`,
       { stdio: ['pipe', 'pipe', 'pipe'], encoding: 'utf-8' },
     );
     const orphans = output.trim().split('\n').filter(Boolean);
     for (const name of orphans) {
       try {
-        execSync(stopContainer(name), { stdio: 'pipe' });
+        execSyncFn(stopContainer(name), { stdio: 'pipe' });
       } catch {
         /* already stopped */
       }
     }
     if (orphans.length > 0) {
-      logger.info(
+      loggerLike.info(
         { count: orphans.length, names: orphans },
         'Stopped orphaned containers',
       );
     }
   } catch (err) {
-    logger.warn({ err }, 'Failed to clean up orphaned containers');
+    loggerLike.warn({ err }, 'Failed to clean up orphaned containers');
   }
 }
