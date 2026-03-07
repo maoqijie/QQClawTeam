@@ -498,6 +498,9 @@ async function main(): Promise<void> {
   logger.info('Database initialized');
   loadState();
 
+  // Forward reference for discussion engine (assigned after fleet init)
+  let discussionEngineRef: DiscussionEngine | null = null;
+
   // Graceful shutdown handlers (fleetManager captured in closure after init)
   let _fleetManagerRef: NapCatFleetManager | null = null;
   const shutdown = async (signal: string) => {
@@ -530,6 +533,12 @@ async function main(): Promise<void> {
         }
       }
       storeMessage(msg);
+
+      // Forward user messages to active discussions
+      if (discussionEngineRef && !msg.is_bot_message) {
+        const groupId = chatJid.startsWith('qq:group:') ? chatJid.split(':')[2] : chatJid;
+        discussionEngineRef.handleGroupMessage(groupId, msg.sender, msg.content, msg.sender_name);
+      }
     },
     onChatMetadata: (
       chatJid: string,
@@ -653,6 +662,7 @@ async function main(): Promise<void> {
           history,
           '',
           '请基于以上讨论，从你的角色视角发表你的观点和建议。保持简洁有力，200字以内。',
+          '如果讨论历史中有 ⚠️ [用户反馈]，请务必认真参考用户的意见，调整你的观点和建议方向。',
           '直接输出你的观点，不要加角色名前缀。',
         ].filter(Boolean).join('\n');
 
@@ -741,6 +751,8 @@ async function main(): Promise<void> {
           if (channel) await channel.sendMessage(task.userChatJid, text);
         }
       },
+      getAccountCount: () => fleetManager?.getAllBotAccounts().size ?? 0,
+      getMainAccount: () => fleetManager?.getMainAccount(),
       onDiscussionComplete: async (taskId, result) => {
         const task = dbGetTeamTask(taskId);
         if (!task) return;
@@ -781,6 +793,7 @@ async function main(): Promise<void> {
     });
 
     _fleetManagerRef = fleetManager;
+    discussionEngineRef = discussionEngine;
 
     logger.info({
       accounts: fleetConfig.accounts.length,

@@ -32,6 +32,7 @@ export interface DiscussionState {
   turnOrder: string[];  // QQ accounts in speaking order
   currentTurnIndex: number;
   participants: DiscussionParticipant[];
+  moderatorAccount?: string;  // 主持人 QQ 账号（3+ 账号时启用）
   createdAt: string;
   updatedAt: string;
 }
@@ -43,7 +44,7 @@ export interface DiscussionMessage {
   senderAccount: string;
   senderRole: string;
   content: string;
-  messageType: 'contribution' | 'synthesis' | 'system';
+  messageType: 'contribution' | 'synthesis' | 'system' | 'user_input';
   timestamp: string;
 }
 
@@ -89,6 +90,14 @@ export interface DiscussionEngineDeps {
    * Called when discussion completes, with the synthesis result.
    */
   onDiscussionComplete: (taskId: string, result: string) => Promise<void>;
+  /**
+   * Get the number of available QQ bot accounts.
+   */
+  getAccountCount: () => number;
+  /**
+   * Get the main QQ account (used as moderator when 3+ accounts).
+   */
+  getMainAccount: () => string | undefined;
 }
 
 export class DiscussionEngine {
@@ -119,7 +128,16 @@ export class DiscussionEngine {
       };
     });
 
-    const turnOrder = participants.map((p) => p.qqAccount);
+    // Determine if moderator should be enabled (3+ accounts)
+    let moderatorAccount: string | undefined;
+    if (this.deps.getAccountCount() >= 3) {
+      moderatorAccount = this.deps.getMainAccount();
+    }
+
+    // Moderator does not participate in regular turn order
+    const turnOrder = participants
+      .filter((p) => p.qqAccount !== moderatorAccount)
+      .map((p) => p.qqAccount);
 
     const state: DiscussionState = {
       id,
@@ -131,6 +149,7 @@ export class DiscussionEngine {
       turnOrder,
       currentTurnIndex: 0,
       participants,
+      moderatorAccount,
       createdAt: now,
       updatedAt: now,
     };
@@ -296,6 +315,62 @@ export class DiscussionEngine {
   }
 
   /**
+   * Run moderator review after all agents have spoken in a round.
+   * Returns 'conclude' if moderator decides to end, 'continue' otherwise.
+   */
+  private async runModeratorReview(state: DiscussionState): Promise<'continue' | 'conclude'> {
+    if (!state.moderatorAccount) return 'continue';
+
+    const history = this.formatDiscussionHistory(state);
+    const taskDescription = this.deps.getTaskDescription(state.taskId);
+
+    const moderatorPrompt = [
+      '你是讨论主持人，负责控制讨论方向和质量。',
+      '',
+      `原始需求: ${taskDescription}`,
+      '',
+      `当前讨论记录:`,
+      history,
+      '',
+      '请评估当前讨论:',
+      '1. 讨论方向是否偏离了原始需求？',
+      '2. 有没有重要的遗漏点？',
+      '3. 各Agent的观点是否有明显的错误或不合理之处？',
+      '',
+      '请用以下格式回复:',
+      '- 如果讨论方向正确且充分，回复: [结论] 讨论充分，可以总结了',
+      '- 如果方向正确但还需深入，回复你的引导意见（200字以内）',
+      '- 如果方向偏了，回复纠正意见（200字以内）',
+    ].join('\n');
+
+    const response = await this.deps.runAgentTurn(
+      { qqAccount: state.moderatorAccount, roleName: '主持人', systemPrompt: '你是讨论主持人' },
+      taskDescription,
+      moderatorPrompt,
+      state.currentRound,
+      state.taskId,
+    );
+
+    // Set group card and send moderator comment
+    await this.deps.setGroupCard(state.qqGroupId, state.moderatorAccount, '主持人');
+    await this.deps.sendAsAccount(state.qqGroupId, state.moderatorAccount, response);
+
+    // Record moderator message
+    this.deps.db.addDiscussionMessage({
+      discussionId: state.id,
+      round: state.currentRound,
+      senderAccount: state.moderatorAccount,
+      senderRole: '主持人',
+      content: response,
+      messageType: 'contribution',
+      timestamp: new Date().toISOString(),
+    });
+
+    if (response.includes('[结论]')) return 'conclude';
+    return 'continue';
+  }
+
+  /**
    * Evaluate whether another round is needed after all agents have spoken.
    */
   private async evaluateRound(state: DiscussionState): Promise<void> {
@@ -304,6 +379,20 @@ export class DiscussionEngine {
       round: state.currentRound,
       maxRounds: state.maxRounds,
     }, 'Evaluating round');
+
+    // If moderator is enabled, run moderator review first
+    if (state.moderatorAccount) {
+      try {
+        const verdict = await this.runModeratorReview(state);
+        if (verdict === 'conclude') {
+          await this.synthesize(state);
+          return;
+        }
+        // 'continue': moderator's comment is recorded in history, next round agents will see it
+      } catch (err) {
+        logger.error({ discussionId: state.id, err }, 'Moderator review failed, falling back to heuristic');
+      }
+    }
 
     if (state.currentRound >= state.maxRounds) {
       // Max rounds reached, synthesize
@@ -463,6 +552,7 @@ export class DiscussionEngine {
     return messages
       .map((m) => {
         if (m.messageType === 'system') return `[系统] ${m.content}`;
+        if (m.messageType === 'user_input') return `⚠️ [用户反馈] ${m.content}`;
         return `[第${m.round}轮 - ${m.senderRole}] ${m.content}`;
       })
       .join('\n\n');
@@ -470,23 +560,31 @@ export class DiscussionEngine {
 
   /**
    * Record a group message into the discussion (for external messages).
+   * Records both participant messages and user messages (non-participants).
    */
-  handleGroupMessage(groupId: string, senderAccount: string, content: string): void {
+  handleGroupMessage(groupId: string, senderAccount: string, content: string, senderName?: string): void {
     const state = this.deps.db.getDiscussionByGroup(groupId);
-    if (!state || state.phase === 'completed') return;
+    if (!state || state.phase === 'completed' || state.phase === 'synthesizing') return;
 
     const participant = state.participants.find((p) => p.qqAccount === senderAccount);
-    if (!participant) return; // Not a participant
 
+    // Also skip moderator's own messages (already recorded via runModeratorReview)
+    if (senderAccount === state.moderatorAccount) return;
+
+    // Record message — both participants and users
     this.deps.db.addDiscussionMessage({
       discussionId: state.id,
       round: state.currentRound,
       senderAccount,
-      senderRole: participant.roleName,
+      senderRole: participant ? participant.roleName : `用户(${senderName || senderAccount})`,
       content,
-      messageType: 'contribution',
+      messageType: participant ? 'contribution' : 'user_input',
       timestamp: new Date().toISOString(),
     });
+
+    if (!participant) {
+      logger.info({ discussionId: state.id, sender: senderAccount, content: content.slice(0, 100) }, 'User message recorded in discussion');
+    }
   }
 
   /**
