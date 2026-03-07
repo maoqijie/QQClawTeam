@@ -61,7 +61,7 @@ import {
   getDiscussionByGroup as dbGetDiscussionByGroup,
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
-import { resolveGroupFolderPath } from './group-folder.js';
+import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
 import { findChannel, formatMessages, formatOutbound } from './router.js';
 import {
@@ -626,7 +626,7 @@ async function main(): Promise<void> {
           await qqBridge.sendAsAccount(groupId, qqAccount, text);
         }
       },
-      runAgentTurn: async (participant, taskDescription, history, round) => {
+      runAgentTurn: async (participant, taskDescription, history, round, taskId) => {
         // Build a prompt for the agent's turn
         const prompt = [
           `你是一个团队讨论中的 ${participant.roleName}。`,
@@ -640,11 +640,82 @@ async function main(): Promise<void> {
           history,
           '',
           '请基于以上讨论，从你的角色视角发表你的观点和建议。保持简洁有力，200字以内。',
+          '直接输出你的观点，不要加角色名前缀。',
         ].filter(Boolean).join('\n');
 
-        // For now, return a placeholder - in production this would spawn a container
-        // The actual agent container spawning will be done through the existing runContainerAgent
-        return `[${participant.roleName}] 正在思考中...（讨论引擎已就绪，需要配置Agent容器启动）`;
+        // Create a temporary group folder for this discussion agent
+        const discFolder = `disc_${taskId.replace(/[^a-zA-Z0-9-]/g, '_')}`;
+        const discGroupDir = resolveGroupFolderPath(discFolder);
+        fs.mkdirSync(path.join(discGroupDir, 'logs'), { recursive: true });
+
+        // Write role-specific CLAUDE.md
+        const claudeMdPath = path.join(discGroupDir, 'CLAUDE.md');
+        fs.writeFileSync(claudeMdPath, [
+          `# ${participant.roleName}`,
+          '',
+          `你是团队讨论中的 ${participant.roleName}。`,
+          participant.systemPrompt || '',
+          '',
+          '## 行为规范',
+          '',
+          '- 直接输出你的观点和建议',
+          '- 保持简洁有力，200字以内',
+          '- 不要使用工具（不搜索网页、不读写文件），直接基于你的知识回答',
+          '- 不要加角色名前缀，直接发表观点',
+        ].join('\n'));
+
+        const discGroup: RegisteredGroup = {
+          name: `Discussion ${participant.roleName}`,
+          folder: discFolder,
+          trigger: `@${ASSISTANT_NAME}`,
+          added_at: new Date().toISOString(),
+          requiresTrigger: false,
+        };
+
+        // Run container agent and collect response.
+        // Discussion turns are one-shot: after the first result, write a _close
+        // sentinel so the container exits instead of waiting for more IPC messages.
+        let responseText = '';
+        const ipcInputDir = path.join(resolveGroupIpcPath(discFolder), 'input');
+        fs.mkdirSync(ipcInputDir, { recursive: true });
+
+        await runContainerAgent(
+          discGroup,
+          {
+            prompt,
+            groupFolder: discFolder,
+            chatJid: 'discussion-internal',
+            isMain: false,
+            assistantName: participant.roleName,
+            teamTaskId: taskId,
+          },
+          (_proc, _containerName) => {
+            // Discussion turn agents are fire-and-forget, no queue registration needed
+          },
+          async (result) => {
+            if (result.result) {
+              const text = typeof result.result === 'string'
+                ? result.result
+                : JSON.stringify(result.result);
+              // Strip internal tags
+              const cleaned = text.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
+              if (cleaned) responseText += cleaned;
+            }
+            // After any output (including null results that signal query completion),
+            // close the container so it exits promptly.
+            try {
+              fs.writeFileSync(path.join(ipcInputDir, '_close'), '');
+            } catch {
+              // Ignore - container may have already exited
+            }
+          },
+        );
+
+        if (!responseText) {
+          throw new Error('Agent produced no output');
+        }
+
+        return responseText.trim();
       },
       getTaskDescription: (taskId) => {
         const task = dbGetTeamTask(taskId);

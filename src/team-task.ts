@@ -123,22 +123,25 @@ export class TeamTaskManager {
 
     const availableAgents = this.getAvailableAgents(assignedAccounts);
 
-    if (availableAgents.length < task.agentRoles.length) {
+    if (availableAgents.length === 0) {
       logger.warn({
         taskId,
         needed: task.agentRoles.length,
-        available: availableAgents.length,
-      }, 'Not enough agents available');
+        available: 0,
+      }, 'No agents available');
       return null;
     }
 
+    // Cycle through available agents when there are fewer accounts than roles.
+    // This allows a single agent account to play multiple roles in turn-based
+    // discussions, where messages are distinguished by role name prefix.
     const assignments: AgentAssignment[] = [];
     for (let i = 0; i < task.agentRoles.length; i++) {
       const role = task.agentRoles[i];
       const assignment: AgentAssignment = {
         id: `aa-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
         taskId,
-        qqAccount: availableAgents[i],
+        qqAccount: availableAgents[i % availableAgents.length],
         roleName: role.roleName,
         status: 'assigned',
       };

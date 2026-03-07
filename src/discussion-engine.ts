@@ -71,6 +71,7 @@ export interface DiscussionEngineDeps {
     taskDescription: string,
     discussionHistory: string,
     round: number,
+    taskId: string,
   ) => Promise<string>;
   /**
    * Get the task description for context.
@@ -228,6 +229,7 @@ export class DiscussionEngine {
           taskDescription,
           history,
           state.currentRound,
+          state.taskId,
         ),
         new Promise<string>((_, reject) =>
           setTimeout(() => reject(new Error('Turn timeout')), DISCUSSION_TURN_TIMEOUT),
