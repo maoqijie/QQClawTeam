@@ -12,6 +12,10 @@ import { resolveGroupFolderPath } from '../group-folder.js';
 import { logger } from '../logger.js';
 import { NapCatFleetManager } from '../napcat-fleet.js';
 import {
+  generateQrCodePngBase64,
+  generateQrCodeSvg,
+} from '../qr-code.js';
+import {
   isMessageEvent,
   isMetaEvent,
   parseMessageEvent,
@@ -70,6 +74,7 @@ export interface QQBridgeConfig {
   host: string;
   port: number;
   outboundUrl: string;
+  publicBaseUrl?: string;
   sharedSecret?: string;
   commandPrefixes: string[];
   autoRegisterPrivate: boolean;
@@ -102,6 +107,15 @@ export interface QQBridgeRegistration {
 }
 
 type FetchFn = typeof fetch;
+
+type PrivateBridgeCommand = 'create-bot-account' | 'refresh-bot-account';
+
+interface LoginTicketView {
+  id: string;
+  svg: string;
+  createdAt: string;
+  expiresAt: string;
+}
 
 interface OutboundJob {
   kind: 'message' | 'typing';
@@ -175,6 +189,28 @@ function findMatchedPrefix(
 function trimCommandPrefix(text: string, prefix: string): string {
   const trimmed = text.trimStart();
   return trimmed.slice(prefix.length).trimStart();
+}
+
+function parsePrivateBridgeCommand(text: string): PrivateBridgeCommand | null {
+  const normalized = text.trim().toLowerCase().replace(/\s+/g, '');
+  if (!normalized) return null;
+
+  const createPatterns = [
+    /^\/?(?:加|添加|新增)(?:机器人|bot)(?:账号)?$/i,
+    /^\/?addbot(?:account)?$/i,
+  ];
+  const refreshPatterns = [
+    /^\/?(?:刷新|重发)(?:机器人|bot)(?:二维码|登录码|账号)?$/i,
+    /^\/?refreshbot(?:qr|qrcode|account)?$/i,
+  ];
+
+  if (createPatterns.some((pattern) => pattern.test(normalized))) {
+    return 'create-bot-account';
+  }
+  if (refreshPatterns.some((pattern) => pattern.test(normalized))) {
+    return 'refresh-bot-account';
+  }
+  return null;
 }
 
 export function toQqJid(chatType: 'private' | 'group', chatId: string): string {
@@ -468,10 +504,12 @@ export class QQBridgeChannel implements Channel {
   private boundPort: number | null = null;
   private readonly dispatcher: OutboundDispatcher;
   private fleetManager: NapCatFleetManager | null = null;
+  private loginTickets = new Map<string, LoginTicketView>();
   /** Sliding window of recently seen message IDs for dedup (OneBot multi-bot scenario). */
   private recentMessageIds = new Set<string>();
   private messageIdOrder: string[] = [];
   private static readonly DEDUP_WINDOW = 1000;
+  private static readonly LOGIN_TICKET_TTL_MS = 10 * 60 * 1000;
 
   constructor(
     private readonly config: QQBridgeConfig,
@@ -486,6 +524,119 @@ export class QQBridgeChannel implements Channel {
    */
   setFleetManager(manager: NapCatFleetManager): void {
     this.fleetManager = manager;
+  }
+
+  private cleanupLoginTickets(): void {
+    const now = Date.now();
+    for (const [ticketId, ticket] of this.loginTickets.entries()) {
+      if (Date.parse(ticket.expiresAt) <= now) {
+        this.loginTickets.delete(ticketId);
+      }
+    }
+  }
+
+  private resolvePublicBaseUrl(): string | null {
+    if (this.config.publicBaseUrl) {
+      return this.config.publicBaseUrl.replace(/\/$/, '');
+    }
+
+    const host = this.config.host;
+    const port = this.boundPort || this.config.port;
+    if (!host || host === '127.0.0.1' || host === '0.0.0.0' || host === '::1') {
+      return null;
+    }
+    return `http://${host}:${port}`;
+  }
+
+  private buildTicketPreviewUrl(ticketId: string): string | null {
+    const baseUrl = this.resolvePublicBaseUrl();
+    if (!baseUrl) return null;
+    return `${baseUrl}/qq-bridge/bot-login/${encodeURIComponent(ticketId)}`;
+  }
+
+  private async sendBotLoginTicket(
+    chatId: string,
+    chatJid: string,
+  ): Promise<void> {
+    if (!this.fleetManager) {
+      await this.sendMessage(
+        chatJid,
+        '⚠️ 当前没有启用 NapCat 账号池，暂时无法扫码新增机器人账号。',
+      );
+      return;
+    }
+
+    try {
+      const ticket = await this.fleetManager.createAgentLoginTicket();
+      const svg = await generateQrCodeSvg(ticket.qrCodeText);
+      const pngBase64 = await generateQrCodePngBase64(ticket.qrCodeText);
+      this.loginTickets.set(ticket.id, {
+        id: ticket.id,
+        svg,
+        createdAt: ticket.createdAt,
+        expiresAt: ticket.expiresAt,
+      });
+      this.cleanupLoginTickets();
+
+      const previewUrl = this.buildTicketPreviewUrl(ticket.id);
+      const expiresAtText = new Date(ticket.expiresAt).toLocaleString('zh-CN', {
+        hour12: false,
+      });
+
+      const lines = [
+        '✅ 已创建新的机器人账号登录会话。',
+        `会话ID：${ticket.id}`,
+        `二维码有效期至：${expiresAtText}`,
+        '请尽快扫码，登录成功后系统会自动把新账号接入 Agent 池。',
+      ];
+      if (previewUrl) {
+        lines.push(`备用预览地址：${previewUrl}`);
+      }
+      lines.push('如果二维码过期了，重新私聊发送“刷新机器人二维码”即可。');
+
+      await this.sendMessage(chatJid, lines.join('\n'));
+
+      const mainConnector = this.fleetManager.getMainConnector();
+      if (mainConnector) {
+        try {
+          await mainConnector.sendPrivateImageBase64(chatId, pngBase64);
+        } catch (error) {
+          logger.warn({ err: error, chatId }, 'Failed to send bot login QR image');
+        }
+      }
+    } catch (error) {
+      await this.sendMessage(
+        chatJid,
+        `⚠️ 新建机器人账号登录会话失败：${error instanceof Error ? error.message : '未知错误'}`,
+      );
+    }
+  }
+
+  private async maybeHandlePrivateBridgeCommand(payload: {
+    chatId: string;
+    chatJid: string;
+    chatType: 'private' | 'group';
+    content: string;
+  }): Promise<boolean> {
+    if (payload.chatType !== 'private') return false;
+
+    const command = parsePrivateBridgeCommand(payload.content);
+    if (!command) return false;
+
+    if (!this.fleetManager) {
+      await this.sendMessage(
+        payload.chatJid,
+        '⚠️ 当前未接入 NapCat 多账号管理，无法为你创建新的机器人登录二维码。',
+      );
+      return true;
+    }
+
+    if (command === 'create-bot-account' || command === 'refresh-bot-account') {
+      await this.sendBotLoginTicket(payload.chatId, payload.chatJid);
+      return true;
+    }
+
+    return false;
   }
 
   /**
@@ -594,8 +745,63 @@ export class QQBridgeChannel implements Channel {
     response: ServerResponse,
   ): Promise<void> {
     try {
+      const url = new URL(
+        request.url || '/',
+        `http://${request.headers.host || '127.0.0.1'}`,
+      );
+
       if (request.url === '/healthz' && request.method === 'GET') {
         jsonResponse(response, 200, { ok: true, channel: this.name });
+        return;
+      }
+
+      const ticketMatch = url.pathname.match(/^\/qq-bridge\/bot-login\/([^/]+?)(\.svg)?$/);
+      if (ticketMatch && request.method === 'GET') {
+        this.cleanupLoginTickets();
+        const ticketId = decodeURIComponent(ticketMatch[1]!);
+        const ticket = this.loginTickets.get(ticketId);
+        if (!ticket) {
+          response.statusCode = 404;
+          response.setHeader('content-type', 'text/plain; charset=utf-8');
+          response.end('QR ticket not found or expired');
+          return;
+        }
+
+        if (ticketMatch[2] === '.svg') {
+          response.statusCode = 200;
+          response.setHeader('content-type', 'image/svg+xml; charset=utf-8');
+          response.end(ticket.svg);
+          return;
+        }
+
+        response.statusCode = 200;
+        response.setHeader('content-type', 'text/html; charset=utf-8');
+        response.end(`<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>机器人账号登录二维码</title>
+    <style>
+      body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; padding: 24px; color: #111827; background: #f9fafb; }
+      main { max-width: 420px; margin: 0 auto; background: #fff; border-radius: 16px; padding: 24px; box-shadow: 0 10px 30px rgba(0,0,0,.08); }
+      h1 { font-size: 20px; margin: 0 0 12px; }
+      p { line-height: 1.6; }
+      .qr { margin: 20px 0; display: flex; justify-content: center; }
+      .meta { color: #4b5563; font-size: 14px; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>机器人账号登录二维码</h1>
+      <p>请使用要接入的新 QQ 账号扫码登录。扫码成功后，系统会自动将该账号纳入 Agent 池。</p>
+      <div class="qr">${ticket.svg}</div>
+      <p class="meta">会话ID：${ticket.id}</p>
+      <p class="meta">创建时间：${new Date(ticket.createdAt).toLocaleString('zh-CN', { hour12: false })}</p>
+      <p class="meta">失效时间：${new Date(ticket.expiresAt).toLocaleString('zh-CN', { hour12: false })}</p>
+    </main>
+  </body>
+</html>`);
         return;
       }
 
@@ -607,20 +813,20 @@ export class QQBridgeChannel implements Channel {
         }
       }
 
-      if (request.url === '/qq-bridge/inbound' && request.method === 'POST') {
+      if (url.pathname === '/qq-bridge/inbound' && request.method === 'POST') {
         const rawBody = await readJsonBody(request);
         const raw = rawBody as Record<string, unknown>;
 
         // Detect raw OneBot v11 events (NapCat direct reporting)
         if (raw.post_type) {
-          const onebotResult = this.acceptOneBotEvent(raw);
+          const onebotResult = await this.acceptOneBotEvent(raw);
           jsonResponse(response, 200, onebotResult);
           return;
         }
 
         // Normalized format (external bridge)
         const payload = inboundPayloadSchema.parse(rawBody);
-        const result = this.acceptInbound(payload);
+        const result = await this.acceptInbound(payload);
         jsonResponse(response, 200, {
           ok: true,
           accepted: result.accepted,
@@ -631,7 +837,7 @@ export class QQBridgeChannel implements Channel {
       }
 
       if (
-        request.url === '/qq-bridge/chats/register' &&
+        url.pathname === '/qq-bridge/chats/register' &&
         request.method === 'POST'
       ) {
         const rawBody = await readJsonBody(request);
@@ -663,7 +869,7 @@ export class QQBridgeChannel implements Channel {
         return;
       }
 
-      if (request.url === '/qq-bridge/chats' && request.method === 'GET') {
+      if (url.pathname === '/qq-bridge/chats' && request.method === 'GET') {
         const groups = Object.entries(this.opts.registeredGroups())
           .filter(([jid]) => jid.startsWith('qq:'))
           .map(([jid, group]) => ({ jid, ...group }));
@@ -686,7 +892,9 @@ export class QQBridgeChannel implements Channel {
    * Bot messages are NOT stored into the main messages table to prevent feedback loops.
    * Only processes messages from the main bot account to avoid duplicates.
    */
-  private acceptOneBotEvent(raw: Record<string, unknown>): Record<string, unknown> {
+  private async acceptOneBotEvent(
+    raw: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
     // Ignore meta events (heartbeat, lifecycle)
     if (isMetaEvent(raw)) {
       return { ok: true, action: 'ignored', reason: 'meta_event' };
@@ -761,6 +969,16 @@ export class QQBridgeChannel implements Channel {
       content = defaultTriggerText(content);
     }
 
+    const handled = await this.maybeHandlePrivateBridgeCommand({
+      chatId,
+      chatJid,
+      chatType,
+      content,
+    });
+    if (handled) {
+      return { ok: true, action: 'handled', reason: 'private_command' };
+    }
+
     this.opts.onMessage(chatJid, {
       id: parsed.messageId,
       chat_jid: chatJid,
@@ -775,11 +993,13 @@ export class QQBridgeChannel implements Channel {
     return { ok: true, action: 'accepted', chatJid };
   }
 
-  private acceptInbound(payload: z.infer<typeof inboundPayloadSchema>): {
+  private async acceptInbound(
+    payload: z.infer<typeof inboundPayloadSchema>,
+  ): Promise<{
     accepted: boolean;
     registered: boolean;
     chatJid: string;
-  } {
+  }> {
     const normalized = normalizeInboundMessage(payload, this.config);
     this.opts.onChatMetadata(
       normalized.chatJid,
@@ -815,6 +1035,20 @@ export class QQBridgeChannel implements Channel {
     if (!shouldStoreMessage) {
       return {
         accepted: false,
+        registered,
+        chatJid: normalized.chatJid,
+      };
+    }
+
+    const handled = await this.maybeHandlePrivateBridgeCommand({
+      chatId: normalized.chatId,
+      chatJid: normalized.chatJid,
+      chatType: normalized.chatType,
+      content: normalized.content,
+    });
+    if (handled) {
+      return {
+        accepted: true,
         registered,
         chatJid: normalized.chatJid,
       };
@@ -871,6 +1105,7 @@ export function loadQQBridgeConfig(): QQBridgeConfig {
     'QQ_BRIDGE_HOST',
     'QQ_BRIDGE_PORT',
     'QQ_BRIDGE_OUTBOUND_URL',
+    'QQ_BRIDGE_PUBLIC_BASE_URL',
     'QQ_BRIDGE_SHARED_SECRET',
     'QQ_BRIDGE_COMMAND_PREFIXES',
     'QQ_BRIDGE_AUTO_REGISTER_PRIVATE',
@@ -895,6 +1130,10 @@ export function loadQQBridgeConfig(): QQBridgeConfig {
     ),
     outboundUrl:
       process.env.QQ_BRIDGE_OUTBOUND_URL || env.QQ_BRIDGE_OUTBOUND_URL || '',
+    publicBaseUrl:
+      process.env.QQ_BRIDGE_PUBLIC_BASE_URL ||
+      env.QQ_BRIDGE_PUBLIC_BASE_URL ||
+      undefined,
     sharedSecret:
       process.env.QQ_BRIDGE_SHARED_SECRET ||
       env.QQ_BRIDGE_SHARED_SECRET ||

@@ -101,6 +101,26 @@
 
 连接器返回任意 `2xx` 即视为成功；`429`、`5xx` 等可重试状态会自动退避重试。
 
+## 主 bot 私聊指令
+
+当 `NapCat Fleet` 运行在 `docker` 模式时，用户可以直接私聊主 bot：
+
+- `加机器人账号`
+- `添加机器人账号`
+- `刷新机器人二维码`
+
+系统会自动创建一个新的登录容器，生成二维码，并把二维码图片回发到当前私聊窗口。扫码成功后，新 QQ 账号会自动接入 Agent 池。
+
+如果你希望同时附带一个可点击的二维码预览页，可以额外配置：
+
+```env
+QQ_BRIDGE_PUBLIC_BASE_URL=https://your-public-host
+```
+
+这样系统还会返回备用链接：
+
+- `https://your-public-host/qq-bridge/bot-login/<ticketId>`
+
 ## 推荐默认值
 
 ```env
@@ -108,6 +128,7 @@ QQ_BRIDGE_ENABLED=true
 QQ_BRIDGE_HOST=127.0.0.1
 QQ_BRIDGE_PORT=8787
 QQ_BRIDGE_OUTBOUND_URL=http://127.0.0.1:3001/send
+QQ_BRIDGE_PUBLIC_BASE_URL=
 QQ_BRIDGE_SHARED_SECRET=change-me
 QQ_BRIDGE_COMMAND_PREFIXES=/ai,#ai
 QQ_BRIDGE_AUTO_REGISTER_PRIVATE=true

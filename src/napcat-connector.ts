@@ -5,6 +5,11 @@
 
 import { logger } from './logger.js';
 
+export interface OneBotMessageSegment {
+  type: string;
+  data: Record<string, string | number | boolean>;
+}
+
 export interface OneBotResponse {
   status: string;
   retcode: number;
@@ -64,11 +69,45 @@ export class NapCatConnector {
     });
   }
 
+  async sendGroupMsgSegments(
+    groupId: string,
+    message: OneBotMessageSegment[],
+  ): Promise<OneBotResponse> {
+    return this.callApi('send_group_msg', {
+      group_id: Number(groupId),
+      message,
+    });
+  }
+
   async sendPrivateMsg(userId: string, message: string): Promise<OneBotResponse> {
     return this.callApi('send_private_msg', {
       user_id: Number(userId),
       message: [{ type: 'text', data: { text: message } }],
     });
+  }
+
+  async sendPrivateMsgSegments(
+    userId: string,
+    message: OneBotMessageSegment[],
+  ): Promise<OneBotResponse> {
+    return this.callApi('send_private_msg', {
+      user_id: Number(userId),
+      message,
+    });
+  }
+
+  async sendPrivateImageBase64(
+    userId: string,
+    base64: string,
+  ): Promise<OneBotResponse> {
+    return this.sendPrivateMsgSegments(userId, [
+      {
+        type: 'image',
+        data: {
+          file: `base64://${base64}`,
+        },
+      },
+    ]);
   }
 
   async getGroupList(): Promise<OneBotGroupInfo[]> {
