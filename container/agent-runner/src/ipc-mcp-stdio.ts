@@ -66,6 +66,67 @@ server.tool(
 );
 
 server.tool(
+  'list_bot_accounts',
+  'List currently connected bot accounts that can be used for scheduling/collaboration. Main private chat only.',
+  {},
+  async () => {
+    if (!isMain) {
+      return {
+        content: [{ type: 'text' as const, text: 'Only the main agent can inspect the connected bot account list.' }],
+        isError: true,
+      };
+    }
+
+    const accountsFile = path.join(IPC_DIR, 'bot_accounts.json');
+    if (!fs.existsSync(accountsFile)) {
+      return {
+        content: [{ type: 'text' as const, text: 'No bot account snapshot available yet.' }],
+      };
+    }
+
+    const payload = JSON.parse(fs.readFileSync(accountsFile, 'utf-8')) as {
+      accounts?: Array<{ qqAccount: string; role: string; status: string }>;
+      lastSync?: string;
+    };
+    const accounts = payload.accounts || [];
+    if (accounts.length === 0) {
+      return {
+        content: [{ type: 'text' as const, text: 'There are currently no connected bot accounts available.' }],
+      };
+    }
+
+    const lines = [
+      `Connected bot accounts: ${accounts.length}`,
+      ...accounts.map((account) => `- ${account.qqAccount} (${account.role}, ${account.status})`),
+    ];
+    if (payload.lastSync) {
+      lines.push(`Last sync: ${payload.lastSync}`);
+    }
+
+    return {
+      content: [{ type: 'text' as const, text: lines.join('\n') }],
+    };
+  },
+);
+
+server.tool(
+  'clear_chat_context',
+  'Clear NanoClaw conversation context for the current chat. This resets the current session and message-processing cursor, but does not delete QQ client chat history or unregister the chat.',
+  {},
+  async () => {
+    writeIpcFile(TASKS_DIR, {
+      type: 'clear_chat_context',
+      chatJid,
+      timestamp: new Date().toISOString(),
+    });
+
+    return {
+      content: [{ type: 'text' as const, text: 'Chat context clear requested. The next user message will start from a fresh NanoClaw session.' }],
+    };
+  },
+);
+
+server.tool(
   'show_private_llm_status',
   'Show the current private chat LLM backend/model configuration. Only useful in private chats.',
   {},

@@ -516,6 +516,8 @@ async function runClaudeBackend(containerInput: ContainerInput): Promise<void> {
   // Build initial prompt (drain any pending IPC messages too)
   let prompt = containerInput.prompt;
   prompt = `[Tooling note] When the user asks to add a bot account, refresh a QR code, or view/change/reset the current private chat model config, decide the intent yourself and use the available nanoclaw tools instead of asking for rigid command keywords.\n\n${prompt}`;
+  prompt = `[Tooling note] When the user asks how many scheduling accounts are connected, or asks for the current bot account list, use the available nanoclaw tools to inspect the current connected accounts instead of guessing.\n\n${prompt}`;
+  prompt = `[Tooling note] When the user asks to clear, reset, or forget the current chat context, use the available nanoclaw tools to clear NanoClaw session context. Make it clear that this does not delete QQ client chat history.\n\n${prompt}`;
   if (containerInput.isScheduledTask) {
     prompt = `[SCHEDULED TASK - The following message was sent automatically and is not coming directly from the user or group.]\n\n${prompt}`;
   }

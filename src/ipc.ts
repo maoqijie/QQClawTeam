@@ -16,6 +16,7 @@ export interface IpcDeps {
   registeredGroups: () => Record<string, RegisteredGroup>;
   registerGroup: (jid: string, group: RegisteredGroup) => void;
   requestBotLoginTicket?: (chatJid: string) => Promise<void>;
+  clearChatContext?: (chatJid: string) => Promise<void> | void;
   updatePrivateLlmConfig?: (
     chatJid: string,
     containerConfig: RegisteredGroup['containerConfig'] | undefined,
@@ -188,6 +189,24 @@ export async function processTaskIpc(
   const registeredGroups = deps.registeredGroups();
 
   switch (data.type) {
+    case 'clear_chat_context':
+      if (data.chatJid && deps.clearChatContext) {
+        const targetGroup = registeredGroups[data.chatJid];
+        if (targetGroup && targetGroup.folder === sourceGroup) {
+          await deps.clearChatContext(data.chatJid);
+          logger.info(
+            { chatJid: data.chatJid, sourceGroup },
+            'Chat context cleared via IPC',
+          );
+        } else {
+          logger.warn(
+            { chatJid: data.chatJid, sourceGroup },
+            'Unauthorized clear_chat_context attempt blocked',
+          );
+        }
+      }
+      break;
+
     case 'create_bot_login_ticket':
     case 'refresh_bot_login_ticket':
       if (data.chatJid && deps.requestBotLoginTicket) {

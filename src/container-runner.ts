@@ -737,6 +737,12 @@ export interface AvailableGroup {
   isRegistered: boolean;
 }
 
+export interface AvailableBotAccount {
+  qqAccount: string;
+  role: string;
+  status: string;
+}
+
 /**
  * Write available groups snapshot for the container to read.
  * Only main group can see all available groups (for activation).
@@ -760,6 +766,29 @@ export function writeGroupsSnapshot(
     JSON.stringify(
       {
         groups: visibleGroups,
+        lastSync: new Date().toISOString(),
+      },
+      null,
+      2,
+    ),
+  );
+}
+
+export function writeBotAccountsSnapshot(
+  groupFolder: string,
+  isMain: boolean,
+  accounts: AvailableBotAccount[],
+): void {
+  const groupIpcDir = resolveGroupIpcPath(groupFolder);
+  fs.mkdirSync(groupIpcDir, { recursive: true });
+
+  const visibleAccounts = isMain ? accounts : [];
+  const accountsFile = path.join(groupIpcDir, 'bot_accounts.json');
+  fs.writeFileSync(
+    accountsFile,
+    JSON.stringify(
+      {
+        accounts: visibleAccounts,
         lastSync: new Date().toISOString(),
       },
       null,

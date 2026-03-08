@@ -566,6 +566,28 @@ function buildToolDefinitions(isMain: boolean): ChatCompletionTool[] {
     },
   });
 
+  if (isMain) {
+    tools.push({
+      type: 'function',
+      function: {
+        name: 'list_bot_accounts',
+        description:
+          'List currently connected bot accounts that can be used for scheduling/collaboration.',
+        parameters: { type: 'object', properties: {} },
+      },
+    });
+  }
+
+  tools.push({
+    type: 'function',
+    function: {
+      name: 'clear_chat_context',
+      description:
+        'Clear NanoClaw conversation context for the current chat. This resets the current session and processing cursor, but does not delete QQ client chat history.',
+      parameters: { type: 'object', properties: {} },
+    },
+  });
+
   tools.push({
     type: 'function',
     function: {
@@ -910,6 +932,41 @@ function executeTool(
 
   try {
     switch (name) {
+      case 'list_bot_accounts': {
+        if (!isMain) {
+          return 'Only the main agent can inspect the connected bot account list.';
+        }
+        const accountsFile = path.join(IPC_DIR, 'bot_accounts.json');
+        if (!fs.existsSync(accountsFile)) {
+          return 'No bot account snapshot available yet.';
+        }
+        const payload = JSON.parse(fs.readFileSync(accountsFile, 'utf-8')) as {
+          accounts?: Array<{ qqAccount: string; role: string; status: string }>;
+          lastSync?: string;
+        };
+        const accounts = payload.accounts || [];
+        if (accounts.length === 0) {
+          return 'There are currently no connected bot accounts available.';
+        }
+        const lines = [
+          `Connected bot accounts: ${accounts.length}`,
+          ...accounts.map((account) => `- ${account.qqAccount} (${account.role}, ${account.status})`),
+        ];
+        if (payload.lastSync) {
+          lines.push(`Last sync: ${payload.lastSync}`);
+        }
+        return lines.join('\n');
+      }
+
+      case 'clear_chat_context': {
+        writeIpcFile(TASKS_DIR, {
+          type: 'clear_chat_context',
+          chatJid,
+          timestamp: new Date().toISOString(),
+        });
+        return 'Chat context clear requested. The next user message will start from a fresh NanoClaw session.';
+      }
+
       case 'show_private_llm_status': {
         if (!chatJid.startsWith('qq:private:')) {
           return 'This tool is only available in private chats.';
@@ -1258,6 +1315,12 @@ function buildSystemPrompt(
   );
   parts.push(
     'When the user asks to add a bot account, refresh a QR code, or view/change/reset the current private chat model config, decide the intent yourself and use the corresponding tools instead of asking the user to type rigid command phrases.',
+  );
+  parts.push(
+    'When the user asks how many scheduling accounts are connected, or asks for the current bot account list, use the list_bot_accounts tool instead of guessing from recent chat history.',
+  );
+  parts.push(
+    'When the user asks to clear, reset, or forget the current chat context, use the clear_chat_context tool. Explain that this only clears NanoClaw session context, not the QQ client chat history.',
   );
   parts.push('Your working directory is /workspace/group.');
   parts.push(`Current time: ${new Date().toISOString()}`);

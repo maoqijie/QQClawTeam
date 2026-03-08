@@ -104,6 +104,7 @@ interface PendingLoginSession {
   emittedStates: Set<NapCatLoginLifecycleState>;
   webUiCredential?: string;
   lastLoginStage?: NapCatWebUiLoginStage;
+  lastQrCodeText?: string;
   cleanupStarted?: boolean;
 }
 
@@ -128,6 +129,11 @@ const DYNAMIC_ACCOUNTS_PATH = path.join(
 );
 const PENDING_LOGIN_TTL_MS = 10 * 60 * 1000;
 const PENDING_LOGIN_POLL_INTERVAL_MS = 2000;
+
+function normalizeQrCodeText(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  return value.trim().replace(/&amp;/g, '&');
+}
 
 function parseAccounts(raw: string): NapCatAccountConfig[] {
   if (!raw) return [];
@@ -653,7 +659,20 @@ export class NapCatFleetManager {
 
     for (let attempt = 0; attempt < 20; attempt++) {
       try {
-        await this.callWebUi(webUiPort, credential, '/api/QQLogin/RefreshQRcode', {});
+        if (attempt === 0) {
+          await this.callWebUi(webUiPort, credential, '/api/QQLogin/RefreshQRcode', {});
+          await sleep(1000);
+        }
+
+        const status = await this.getPendingLoginStatus(instance);
+        const fromStatus = normalizeQrCodeText(status.qrcodeurl);
+        if (fromStatus) {
+          if (instance.pendingLogin) {
+            instance.pendingLogin.lastQrCodeText = fromStatus;
+          }
+          await this.emitPendingLoginEvent(instance, 'qr_ready');
+          return fromStatus;
+        }
 
         const response = await this.callWebUi<{ qrcode: string }>(
           webUiPort,
@@ -661,10 +680,14 @@ export class NapCatFleetManager {
           '/api/QQLogin/GetQQLoginQrcode',
           {},
         );
+        const qrCodeText = normalizeQrCodeText(response.data?.qrcode);
 
-        if (response.data?.qrcode) {
+        if (qrCodeText) {
+          if (instance.pendingLogin) {
+            instance.pendingLogin.lastQrCodeText = qrCodeText;
+          }
           await this.emitPendingLoginEvent(instance, 'qr_ready');
-          return response.data.qrcode;
+          return qrCodeText;
         }
       } catch (err) {
         logger.debug(

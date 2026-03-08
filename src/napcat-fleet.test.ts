@@ -69,6 +69,7 @@ function createPendingInstance(options?: {
       onEvent: options?.onEvent,
       emittedStates: new Set(),
       webUiCredential: 'credential-1',
+      lastQrCodeText: undefined,
     },
   };
 }
@@ -233,5 +234,43 @@ describe('NapCatFleetManager login lifecycle', () => {
     );
     expect((manager as any).instances.has('pending-expired')).toBe(false);
     expect(fs.existsSync(instance.dataDir)).toBe(false);
+  });
+
+  it('优先使用登录状态里的 qrcodeurl 作为首次二维码，并修正 HTML 转义', async () => {
+    const manager = createManager();
+    const events: NapCatLoginLifecycleEvent[] = [];
+    const instance = createPendingInstance({
+      onEvent: async (event) => {
+        events.push(event);
+      },
+    });
+
+    (manager as any).getPendingLoginCredential = async () => 'credential-1';
+    (manager as any).callWebUi = async (_port: number, _credential: string, pathname: string) => {
+      if (pathname === '/api/QQLogin/RefreshQRcode') {
+        return { code: 0, message: 'ok' };
+      }
+      if (pathname === '/api/QQLogin/GetQQLoginQrcode') {
+        throw new Error('should not need GetQQLoginQrcode when qrcodeurl is present');
+      }
+      throw new Error(`unexpected pathname: ${pathname}`);
+    };
+    (manager as any).getPendingLoginStatus = async () => ({
+      isLogin: false,
+      loginStage: 'qr_ready',
+      qrcodeurl: 'https://txz.qq.com/p?k=test&amp;f=1600001615',
+    });
+
+    const qrCodeText = await (manager as any).fetchLoginQrCode(instance);
+
+    expect(qrCodeText).toBe('https://txz.qq.com/p?k=test&f=1600001615');
+    expect(instance.pendingLogin?.lastQrCodeText).toBe(
+      'https://txz.qq.com/p?k=test&f=1600001615',
+    );
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        state: 'qr_ready',
+      }),
+    );
   });
 });

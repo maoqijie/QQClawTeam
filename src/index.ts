@@ -18,8 +18,10 @@ import {
   getRegisteredChannelNames,
 } from './channels/registry.js';
 import {
+  AvailableBotAccount,
   ContainerOutput,
   runContainerAgent,
+  writeBotAccountsSnapshot,
   writeGroupsSnapshot,
   writeTasksSnapshot,
 } from './container-runner.js';
@@ -89,6 +91,8 @@ let lastTimestamp = '';
 let sessions: Record<string, string> = {};
 let registeredGroups: Record<string, RegisteredGroup> = {};
 let lastAgentTimestamp: Record<string, string> = {};
+const latePendingMessages = new Map<string, NewMessage[]>();
+let activeFleetManager: NapCatFleetManager | null = null;
 let messageLoopRunning = false;
 
 const channels: Channel[] = [];
@@ -114,6 +118,35 @@ function loadState(): void {
 function saveState(): void {
   setRouterState('last_timestamp', lastTimestamp);
   setRouterState('last_agent_timestamp', JSON.stringify(lastAgentTimestamp));
+}
+
+function pushLatePendingMessage(chatJid: string, msg: NewMessage): void {
+  const existing = latePendingMessages.get(chatJid) || [];
+  existing.push(msg);
+  existing.sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+  latePendingMessages.set(chatJid, existing);
+}
+
+function drainLatePendingMessages(chatJid: string): NewMessage[] {
+  const pending = latePendingMessages.get(chatJid) || [];
+  latePendingMessages.delete(chatJid);
+  return pending;
+}
+
+function clearChatContext(chatJid: string): void {
+  const group = registeredGroups[chatJid];
+  if (!group) {
+    throw new Error(`Chat ${chatJid} is not registered`);
+  }
+
+  delete sessions[group.folder];
+  deleteSession(group.folder);
+  delete lastAgentTimestamp[chatJid];
+  latePendingMessages.delete(chatJid);
+  queue.closeStdin(chatJid);
+  saveState();
+
+  logger.info({ chatJid, folder: group.folder }, 'Cleared chat context');
 }
 
 function registerGroup(jid: string, group: RegisteredGroup): void {
@@ -213,18 +246,26 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   const isMainGroup = group.isMain === true;
 
   const sinceTimestamp = lastAgentTimestamp[chatJid] || '';
+  const lateMessages = drainLatePendingMessages(chatJid);
   const missedMessages = getMessagesSince(
     chatJid,
     sinceTimestamp,
     ASSISTANT_NAME,
   );
 
-  if (missedMessages.length === 0) return true;
+  const combinedMessages = [...missedMessages, ...lateMessages]
+    .filter(
+      (message, index, array) =>
+        array.findIndex((candidate) => candidate.id === message.id) === index,
+    )
+    .sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+
+  if (combinedMessages.length === 0) return true;
 
   // For non-main groups, check if trigger is required and present
   if (!isMainGroup && group.requiresTrigger !== false) {
     const allowlistCfg = loadSenderAllowlist();
-    const hasTrigger = missedMessages.some(
+    const hasTrigger = combinedMessages.some(
       (m) =>
         TRIGGER_PATTERN.test(m.content.trim()) &&
         (m.is_from_me || isTriggerAllowed(chatJid, m.sender, allowlistCfg)),
@@ -232,17 +273,21 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     if (!hasTrigger) return true;
   }
 
-  const prompt = formatMessages(missedMessages, TIMEZONE);
+  const prompt = formatMessages(combinedMessages, TIMEZONE);
 
   // Advance cursor so the piping path in startMessageLoop won't re-fetch
   // these messages. Save the old cursor so we can roll back on error.
   const previousCursor = lastAgentTimestamp[chatJid] || '';
+  const latestMessageTimestamp =
+    combinedMessages[combinedMessages.length - 1].timestamp;
   lastAgentTimestamp[chatJid] =
-    missedMessages[missedMessages.length - 1].timestamp;
+    latestMessageTimestamp > previousCursor
+      ? latestMessageTimestamp
+      : previousCursor;
   saveState();
 
   logger.info(
-    { group: group.name, messageCount: missedMessages.length },
+    { group: group.name, messageCount: combinedMessages.length },
     'Processing messages',
   );
 
@@ -350,6 +395,18 @@ async function runAgent(
     availableGroups,
     new Set(Object.keys(registeredGroups)),
   );
+
+  const botAccounts: AvailableBotAccount[] = activeFleetManager
+    ? activeFleetManager
+        .getAllInstances()
+        .filter((instance) => !instance.pendingLogin)
+        .map((instance) => ({
+          qqAccount: instance.qqAccount,
+          role: instance.role,
+          status: instance.status,
+        }))
+    : [];
+  writeBotAccountsSnapshot(group.folder, isMain, botAccounts);
 
   // Wrap onOutput to track session ID from streamed results
   const wrappedOnOutput = onOutput
@@ -571,6 +628,24 @@ async function main(): Promise<void> {
       }
       storeMessage(msg);
 
+      if (msg.timestamp <= lastTimestamp) {
+        const formatted = formatMessages([msg], TIMEZONE);
+        if (queue.sendMessage(chatJid, formatted)) {
+          logger.info(
+            { chatJid, timestamp: msg.timestamp },
+            'Delivered late-arriving message directly to active container',
+          );
+          return;
+        }
+
+        pushLatePendingMessage(chatJid, msg);
+        queue.enqueueMessageCheck(chatJid);
+        logger.info(
+          { chatJid, timestamp: msg.timestamp },
+          'Queued late-arriving message for out-of-order processing',
+        );
+      }
+
       // Forward user messages to active discussions
       if (discussionEngineRef && !msg.is_bot_message) {
         const groupId = chatJid.startsWith('qq:group:') ? chatJid.split(':')[2] : chatJid;
@@ -623,6 +698,7 @@ async function main(): Promise<void> {
 
   if (fleetConfig.accounts.length > 0) {
     fleetManager = new NapCatFleetManager(fleetConfig);
+    activeFleetManager = fleetManager;
 
     // Attach fleet manager to QQ bridge channel if present
     for (const ch of channels) {
@@ -893,6 +969,7 @@ async function main(): Promise<void> {
     registeredGroups: () => registeredGroups,
     registerGroup,
     requestBotLoginTicket: ipcRequestBotLoginTicket,
+    clearChatContext,
     updatePrivateLlmConfig: updatePrivateChatLlmConfig,
     syncGroups: async (force: boolean) => {
       await Promise.all(
