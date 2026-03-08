@@ -4,7 +4,13 @@
  */
 
 import { logger } from './logger.js';
-import { TeamTaskManager, type AgentRoleConfig } from './team-task.js';
+import {
+  TeamTaskManager,
+  formatAssignmentModelLabel,
+  type AgentAssignment,
+  type AgentRoleConfig,
+  type TeamTask,
+} from './team-task.js';
 import { GroupPoolManager } from './group-pool.js';
 import { DiscussionEngine } from './discussion-engine.js';
 
@@ -26,6 +32,57 @@ export interface TeamTaskIpcDeps {
   groupPool: GroupPoolManager;
   discussionEngine: DiscussionEngine;
   sendMessage: (jid: string, text: string) => Promise<void>;
+}
+
+function formatAssignmentPlanLines(assignments: AgentAssignment[]): string[] {
+  const lines: string[] = [];
+  for (const [index, assignment] of assignments.entries()) {
+    lines.push(
+      `${index + 1}. ${assignment.roleName}（账号 ${assignment.qqAccount}）`,
+    );
+    lines.push(`   - 模型：${formatAssignmentModelLabel(assignment)}`);
+    if (assignment.assignmentReason) {
+      lines.push(`   - 理由：${assignment.assignmentReason}`);
+    }
+  }
+  return lines;
+}
+
+function formatTaskTitle(task: Pick<TeamTask, 'title' | 'description'>): string {
+  return task.title || task.description.slice(0, 50);
+}
+
+function formatAssignmentProposalMessage(
+  task: TeamTask,
+  assignments: AgentAssignment[],
+): string {
+  return [
+    '✅ 已完成任务分工与模型分配建议',
+    `任务: ${formatTaskTitle(task)}`,
+    `任务ID: ${task.id}`,
+    '',
+    '建议方案：',
+    ...formatAssignmentPlanLines(assignments),
+    '',
+    '本小姐已经按每个角色的长处分配了更合适的模型。你觉得这个方案可以吗？',
+    '如果你想调整，直接告诉我想改哪个角色；如果认可，再让我开始讨论。',
+  ].join('\n');
+}
+
+function formatDiscussionStartedMessage(
+  task: TeamTask,
+  groupId: string,
+  assignments: AgentAssignment[],
+): string {
+  return [
+    '🚀 已按确认后的方案启动团队讨论',
+    `任务: ${formatTaskTitle(task)}`,
+    `任务ID: ${task.id}`,
+    `讨论群: ${groupId}`,
+    '',
+    '当前分配：',
+    ...formatAssignmentPlanLines(assignments),
+  ].join('\n');
 }
 
 /**
@@ -70,28 +127,9 @@ export async function processTeamTaskIpc(
           return;
         }
 
-        // Allocate a group from the pool
-        const group = deps.groupPool.allocateGroup(task.id);
-        if (!group) {
-          await deps.sendMessage(
-            data.userChatJid,
-            '⚠️ 当前没有可用的讨论群，请稍后再试。',
-          );
-          deps.taskManager.failTask(task.id, 'No available groups in pool');
-          return;
-        }
-
-        // Start discussion
-        const discussion = deps.discussionEngine.startDiscussion(
-          task,
-          group.qqGroupId,
-          assignments,
-        );
-        deps.taskManager.setTaskGroup(task.id, group.qqGroupId, discussion.id);
-
         await deps.sendMessage(
           data.userChatJid,
-          `✅ 任务已创建并开始讨论\n任务ID: ${task.id}\n讨论群: ${group.qqGroupId}\n参与角色: ${data.roles.map((r) => r.roleName).join(', ')}`,
+          formatAssignmentProposalMessage(task, assignments),
         );
       } else {
         await deps.sendMessage(
@@ -121,7 +159,44 @@ export async function processTeamTaskIpc(
       if (task.discussionId) {
         // Resume existing discussion
         deps.discussionEngine.advanceDiscussion(task.discussionId);
+        await deps.sendMessage(
+          task.userChatJid,
+          `🔁 任务 ${task.id} 的团队讨论已继续。`,
+        );
+        break;
       }
+
+      const assignments = deps.taskManager.getAssignments(task.id);
+      if (assignments.length === 0) {
+        await deps.sendMessage(
+          task.userChatJid,
+          '⚠️ 当前任务还没有有效的 Agent 分配，请重新规划后再启动讨论。',
+        );
+        return;
+      }
+
+      const group = deps.groupPool.allocateGroup(task.id);
+      if (!group) {
+        await deps.sendMessage(
+          task.userChatJid,
+          '⚠️ 当前没有可用的讨论群，请稍后再试。',
+        );
+        deps.taskManager.failTask(task.id, 'No available groups in pool');
+        return;
+      }
+
+      const discussion = deps.discussionEngine.startDiscussion(
+        task,
+        group.qqGroupId,
+        assignments,
+      );
+      deps.taskManager.setTaskGroup(task.id, group.qqGroupId, discussion.id);
+      deps.taskManager.markTaskInProgress(task.id);
+
+      await deps.sendMessage(
+        task.userChatJid,
+        formatDiscussionStartedMessage(task, group.qqGroupId, assignments),
+      );
       break;
     }
 

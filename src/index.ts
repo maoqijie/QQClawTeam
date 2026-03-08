@@ -717,6 +717,12 @@ async function main(): Promise<void> {
           '',
           `你是团队讨论中的 ${participant.roleName}。`,
           participant.systemPrompt || '',
+          participant.llmBackend === 'openai'
+            ? `当前模型：OpenAI-compatible / ${participant.llmModel || OPENAI_MODEL}`
+            : '当前模型：Claude（官方 OAuth / 默认运行配置）',
+          participant.assignmentReason
+            ? `模型分配理由：${participant.assignmentReason}`
+            : '',
           '',
           '## 行为规范',
           '',
@@ -732,6 +738,14 @@ async function main(): Promise<void> {
           trigger: `@${ASSISTANT_NAME}`,
           added_at: new Date().toISOString(),
           requiresTrigger: false,
+          containerConfig: {
+            llmBackend: (participant.llmBackend || LLM_BACKEND) as
+              | 'claude'
+              | 'openai',
+            ...(participant.llmBackend === 'openai' || participant.llmModel
+              ? { llmModel: participant.llmModel || OPENAI_MODEL }
+              : {}),
+          },
         };
 
         // Run container agent and collect response.

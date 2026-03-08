@@ -20,6 +20,9 @@ export interface DiscussionParticipant {
   qqAccount: string;
   roleName: string;
   systemPrompt?: string;
+  llmBackend?: 'claude' | 'openai';
+  llmModel?: string;
+  assignmentReason?: string;
 }
 
 export interface DiscussionState {
@@ -125,6 +128,9 @@ export class DiscussionEngine {
         qqAccount: a.qqAccount,
         roleName: a.roleName,
         systemPrompt: role?.systemPrompt || role?.description,
+        llmBackend: a.llmBackend,
+        llmModel: a.llmModel,
+        assignmentReason: a.assignmentReason,
       };
     });
 

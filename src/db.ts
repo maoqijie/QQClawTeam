@@ -169,6 +169,9 @@ function createSchema(database: Database.Database): void {
       task_id TEXT NOT NULL,
       qq_account TEXT NOT NULL,
       role_name TEXT NOT NULL,
+      llm_backend TEXT,
+      llm_model TEXT,
+      assignment_reason TEXT,
       status TEXT DEFAULT 'assigned',
       FOREIGN KEY (task_id) REFERENCES team_tasks(id)
     );
@@ -212,6 +215,24 @@ function createSchema(database: Database.Database): void {
     );
     CREATE INDEX IF NOT EXISTS idx_disc_msgs ON discussion_messages(discussion_id, round);
   `);
+
+  try {
+    database.exec(`ALTER TABLE agent_assignments ADD COLUMN llm_backend TEXT`);
+  } catch {
+    /* column already exists */
+  }
+
+  try {
+    database.exec(`ALTER TABLE agent_assignments ADD COLUMN llm_model TEXT`);
+  } catch {
+    /* column already exists */
+  }
+
+  try {
+    database.exec(`ALTER TABLE agent_assignments ADD COLUMN assignment_reason TEXT`);
+  } catch {
+    /* column already exists */
+  }
 }
 
 export function initDatabase(): void {
@@ -807,8 +828,17 @@ export function getAllActiveTasks(): TeamTask[] {
 
 export function createAgentAssignment(assignment: AgentAssignment): void {
   db.prepare(
-    `INSERT INTO agent_assignments (id, task_id, qq_account, role_name, status) VALUES (?, ?, ?, ?, ?)`,
-  ).run(assignment.id, assignment.taskId, assignment.qqAccount, assignment.roleName, assignment.status);
+    `INSERT INTO agent_assignments (id, task_id, qq_account, role_name, llm_backend, llm_model, assignment_reason, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    assignment.id,
+    assignment.taskId,
+    assignment.qqAccount,
+    assignment.roleName,
+    assignment.llmBackend || null,
+    assignment.llmModel || null,
+    assignment.assignmentReason || null,
+    assignment.status,
+  );
 }
 
 export function getAssignmentsForTask(taskId: string): AgentAssignment[] {
@@ -818,14 +848,40 @@ export function getAssignmentsForTask(taskId: string): AgentAssignment[] {
     taskId: row.task_id as string,
     qqAccount: row.qq_account as string,
     roleName: row.role_name as string,
+    llmBackend: (row.llm_backend as AgentAssignment['llmBackend'] | null) || undefined,
+    llmModel: (row.llm_model as string | null) || undefined,
+    assignmentReason: (row.assignment_reason as string | null) || undefined,
     status: row.status as AgentAssignment['status'],
   }));
 }
 
 export function updateAgentAssignment(id: string, updates: Partial<AgentAssignment>): void {
+  const fields: string[] = [];
+  const values: unknown[] = [];
+
   if (updates.status !== undefined) {
-    db.prepare('UPDATE agent_assignments SET status = ? WHERE id = ?').run(updates.status, id);
+    fields.push('status = ?');
+    values.push(updates.status);
   }
+
+  if (updates.llmBackend !== undefined) {
+    fields.push('llm_backend = ?');
+    values.push(updates.llmBackend);
+  }
+
+  if (updates.llmModel !== undefined) {
+    fields.push('llm_model = ?');
+    values.push(updates.llmModel);
+  }
+
+  if (updates.assignmentReason !== undefined) {
+    fields.push('assignment_reason = ?');
+    values.push(updates.assignmentReason);
+  }
+
+  if (fields.length === 0) return;
+  values.push(id);
+  db.prepare(`UPDATE agent_assignments SET ${fields.join(', ')} WHERE id = ?`).run(...values);
 }
 
 // --- Group Pool accessors ---

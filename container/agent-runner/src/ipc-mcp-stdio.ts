@@ -338,7 +338,7 @@ Use available_groups.json to find the JID for a group. The folder name must be c
 server.tool(
   'create_team_task',
   `Create a multi-agent collaborative task. Only available to the main agent.
-The task will be assigned to available agent accounts, a discussion group will be allocated from the pool, and agents will discuss in turns.
+The task will be assigned to available agent accounts first. The system will also auto-pick a model for each role based on its strengths, explain the reasons to the user, and wait for the user's opinion before discussion starts.
 
 ROLES: Each role represents an agent perspective. Provide 2-4 roles with distinct viewpoints.
 Example roles: ["架构师", "测试工程师", "安全专家"]`,
@@ -351,6 +351,8 @@ Example roles: ["架构师", "测试工程师", "安全专家"]`,
       roleName: z.string().describe('Role name (e.g. "架构师")'),
       description: z.string().describe('Role description and perspective'),
       systemPrompt: z.string().optional().describe('Custom system prompt for this role'),
+      llmBackend: z.enum(['claude', 'openai']).optional().describe('Optional explicit backend override for this role. Omit to let the system auto-select based on strengths.'),
+      llmModel: z.string().optional().describe('Optional OpenAI-compatible model override for this role.'),
     })).min(2).max(6).describe('Agent roles for the discussion'),
   },
   async (args) => {
@@ -375,6 +377,34 @@ Example roles: ["架构师", "测试工程师", "安全专家"]`,
 
     return {
       content: [{ type: 'text' as const, text: `Team task creation requested. Roles: ${args.roles.map(r => r.roleName).join(', ')}` }],
+    };
+  },
+);
+
+server.tool(
+  'start_team_discussion',
+  'Start a previously planned team discussion after the user has reviewed the role/model assignment proposal. Only available to the main agent.',
+  {
+    task_id: z.string().describe('The team task ID to start'),
+  },
+  async (args) => {
+    if (!isMain) {
+      return {
+        content: [{ type: 'text' as const, text: 'Only the main agent can start team discussions.' }],
+        isError: true,
+      };
+    }
+
+    const data = {
+      type: 'start_discussion',
+      taskId: args.task_id,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(TASKS_DIR, data);
+
+    return {
+      content: [{ type: 'text' as const, text: `Discussion start requested for task ${args.task_id}.` }],
     };
   },
 );

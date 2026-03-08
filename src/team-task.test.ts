@@ -10,7 +10,11 @@ import {
   getAssignmentsForTask,
   updateAgentAssignment,
 } from './db.js';
-import { TeamTaskManager } from './team-task.js';
+import {
+  TeamTaskManager,
+  formatAssignmentModelLabel,
+  recommendLlmForRole,
+} from './team-task.js';
 import type { TeamTask, AgentAssignment, TeamTaskDb } from './team-task.js';
 
 describe('team-task DB operations', () => {
@@ -142,14 +146,18 @@ describe('agent assignments DB', () => {
     });
 
     createAgentAssignment({
-      id: 'aa-1', taskId: 'tt-100', qqAccount: '11111', roleName: '架构师', status: 'assigned',
+      id: 'aa-1', taskId: 'tt-100', qqAccount: '11111', roleName: '架构师',
+      llmBackend: 'claude', assignmentReason: '偏方案设计', status: 'assigned',
     });
     createAgentAssignment({
-      id: 'aa-2', taskId: 'tt-100', qqAccount: '22222', roleName: '测试', status: 'assigned',
+      id: 'aa-2', taskId: 'tt-100', qqAccount: '22222', roleName: '测试',
+      llmBackend: 'openai', llmModel: 'gpt-5.4-pro', assignmentReason: '偏测试验证', status: 'assigned',
     });
 
     const assignments = getAssignmentsForTask('tt-100');
     expect(assignments.length).toBe(2);
+    expect(assignments[0].llmBackend).toBe('claude');
+    expect(assignments[1].llmModel).toBe('gpt-5.4-pro');
   });
 
   it('updates assignment status', () => {
@@ -214,9 +222,43 @@ describe('TeamTaskManager', () => {
     expect(assignments!.length).toBe(2);
     expect(assignments![0].qqAccount).toBe('agent1');
     expect(assignments![1].qqAccount).toBe('agent2');
+    expect(assignments![0].llmBackend).toBe('claude');
+    expect(assignments![1].llmBackend).toBe('openai');
 
     const updated = manager.getTask(task.id);
-    expect(updated!.status).toBe('in_progress');
+    expect(updated!.status).toBe('planning');
+  });
+
+  it('recommends models by role strengths', () => {
+    const architect = recommendLlmForRole({
+      roleName: '架构师',
+      description: '负责系统架构规划与方案整合',
+    });
+    const developer = recommendLlmForRole({
+      roleName: '开发者',
+      description: '负责代码实现、调试和自动化测试',
+    });
+
+    expect(architect.llmBackend).toBe('claude');
+    expect(architect.assignmentReason).toContain('Claude');
+    expect(developer.llmBackend).toBe('openai');
+    expect(developer.llmModel).toBe('gpt-5.4-pro');
+    expect(formatAssignmentModelLabel(developer as AgentAssignment)).toContain(
+      'gpt-5.4-pro',
+    );
+  });
+
+  it('prefers explicit per-role model overrides', () => {
+    const explicit = recommendLlmForRole({
+      roleName: '安全专家',
+      description: '负责安全审查',
+      llmBackend: 'openai',
+      llmModel: 'gpt-5.4-pro',
+    });
+
+    expect(explicit.llmBackend).toBe('openai');
+    expect(explicit.llmModel).toBe('gpt-5.4-pro');
+    expect(explicit.assignmentReason).toContain('显式指定');
   });
 
   it('returns null when not enough agents', () => {

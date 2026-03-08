@@ -97,6 +97,7 @@ OPENAI_MODEL=gpt-5.4-pro
 - **网络访问** - 搜索和抓取网页内容
 - **容器隔离** - 智能体在 Apple Container (macOS) 或 Docker (macOS/Linux) 的沙箱中运行
 - **智能体集群（Agent Swarms）** - 启动多个专业智能体团队，协作完成复杂任务（首个支持此功能的个人 AI 助手）
+- **按模型优势分工** - 团队任务会根据角色特点自动给不同 Agent 推荐 Claude 或 OpenAI-compatible 模型，先说明理由并征求你的意见，再启动讨论
 - **可选集成** - 通过技能添加 Gmail (`/add-gmail`) 等更多功能
 
 ## 使用方法

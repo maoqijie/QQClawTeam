@@ -101,6 +101,7 @@ These commands only affect the current private chat session, not every group or 
 - **Web access** - Search and fetch content from the Web
 - **Container isolation** - Agents are sandboxed in Apple Container (macOS) or Docker (macOS/Linux)
 - **Agent Swarms** - Spin up teams of specialized agents that collaborate on complex tasks. NanoClaw is the first personal AI assistant to support agent swarms.
+- **Model-aware role assignment** - Team tasks can recommend Claude or OpenAI-compatible models per agent role, explain the rationale, and ask for user feedback before the discussion starts
 - **Optional integrations** - Add Gmail (`/add-gmail`) and more via skills
 
 ## Usage
