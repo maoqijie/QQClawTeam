@@ -19,6 +19,9 @@ const TASKS_DIR = path.join(IPC_DIR, 'tasks');
 const chatJid = process.env.NANOCLAW_CHAT_JID!;
 const groupFolder = process.env.NANOCLAW_GROUP_FOLDER!;
 const isMain = process.env.NANOCLAW_IS_MAIN === '1';
+const currentLlmBackend = process.env.NANOCLAW_LLM_BACKEND || 'claude';
+const currentLlmModel = process.env.NANOCLAW_LLM_MODEL || '';
+const isPrivateChat = chatJid.startsWith('qq:private:');
 
 function writeIpcFile(dir: string, data: object): string {
   fs.mkdirSync(dir, { recursive: true });
@@ -59,6 +62,134 @@ server.tool(
     writeIpcFile(MESSAGES_DIR, data);
 
     return { content: [{ type: 'text' as const, text: 'Message sent.' }] };
+  },
+);
+
+server.tool(
+  'show_private_llm_status',
+  'Show the current private chat LLM backend/model configuration. Only useful in private chats.',
+  {},
+  async () => {
+    if (!isPrivateChat) {
+      return {
+        content: [{ type: 'text' as const, text: 'This tool is only available in private chats.' }],
+        isError: true,
+      };
+    }
+
+    const modelLine = currentLlmBackend === 'openai'
+      ? `Model: ${currentLlmModel || 'default OpenAI-compatible model'}`
+      : 'Model: Claude default runtime configuration';
+
+    return {
+      content: [{ type: 'text' as const, text: `Current private chat LLM config\nBackend: ${currentLlmBackend}\n${modelLine}` }],
+    };
+  },
+);
+
+server.tool(
+  'set_private_llm_config',
+  'Set the current private chat LLM backend/model. Takes effect from the next user message. Only available in private chats.',
+  {
+    backend: z.enum(['claude', 'openai']).describe('Target backend for this private chat'),
+    model: z.string().optional().describe('Optional OpenAI-compatible model name when backend=openai'),
+  },
+  async (args) => {
+    if (!isPrivateChat) {
+      return {
+        content: [{ type: 'text' as const, text: 'This tool is only available in private chats.' }],
+        isError: true,
+      };
+    }
+
+    writeIpcFile(TASKS_DIR, {
+      type: 'set_private_llm_config',
+      chatJid,
+      llmBackend: args.backend,
+      llmModel: args.model,
+      timestamp: new Date().toISOString(),
+    });
+
+    return {
+      content: [{
+        type: 'text' as const,
+        text: args.backend === 'openai'
+          ? `Requested OpenAI-compatible backend for this private chat${args.model ? ` with model ${args.model}` : ''}. The change takes effect from the next user message.`
+          : 'Requested Claude backend for this private chat. The change takes effect from the next user message.',
+      }],
+    };
+  },
+);
+
+server.tool(
+  'reset_private_llm_config',
+  'Reset the current private chat LLM config back to the global default. Only available in private chats.',
+  {},
+  async () => {
+    if (!isPrivateChat) {
+      return {
+        content: [{ type: 'text' as const, text: 'This tool is only available in private chats.' }],
+        isError: true,
+      };
+    }
+
+    writeIpcFile(TASKS_DIR, {
+      type: 'reset_private_llm_config',
+      chatJid,
+      timestamp: new Date().toISOString(),
+    });
+
+    return {
+      content: [{ type: 'text' as const, text: 'Requested reset of the private chat model config. The change takes effect from the next user message.' }],
+    };
+  },
+);
+
+server.tool(
+  'create_bot_login_ticket',
+  'Create a new bot login QR code and send it directly to the current private chat. Only available in the main private chat.',
+  {},
+  async () => {
+    if (!isMain || !isPrivateChat) {
+      return {
+        content: [{ type: 'text' as const, text: 'This tool is only available in the main private chat.' }],
+        isError: true,
+      };
+    }
+
+    writeIpcFile(TASKS_DIR, {
+      type: 'create_bot_login_ticket',
+      chatJid,
+      timestamp: new Date().toISOString(),
+    });
+
+    return {
+      content: [{ type: 'text' as const, text: 'Bot login QR creation requested. The QR code image will be sent directly to this private chat.' }],
+    };
+  },
+);
+
+server.tool(
+  'refresh_bot_login_ticket',
+  'Refresh the bot login QR code and send a new one directly to the current private chat. Only available in the main private chat.',
+  {},
+  async () => {
+    if (!isMain || !isPrivateChat) {
+      return {
+        content: [{ type: 'text' as const, text: 'This tool is only available in the main private chat.' }],
+        isError: true,
+      };
+    }
+
+    writeIpcFile(TASKS_DIR, {
+      type: 'refresh_bot_login_ticket',
+      chatJid,
+      timestamp: new Date().toISOString(),
+    });
+
+    return {
+      content: [{ type: 'text' as const, text: 'Bot login QR refresh requested. The new QR code image will be sent directly to this private chat.' }],
+    };
   },
 );
 

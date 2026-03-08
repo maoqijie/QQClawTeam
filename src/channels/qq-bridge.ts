@@ -88,6 +88,7 @@ export interface QQBridgeConfig {
   sendJitterMs: number;
   maxRetries: number;
   baseBackoffMs: number;
+  modelOwnsPrivateCommands: boolean;
 }
 
 export interface QQBridgeInboundMessage {
@@ -131,6 +132,7 @@ interface LoginTicketView {
   chatId: string;
   chatJid: string;
   notifiedStates: Set<NapCatLoginLifecycleState>;
+  lastState?: NapCatLoginLifecycleState;
 }
 
 interface OutboundJob {
@@ -227,11 +229,48 @@ function detectBackendToken(text: string): 'claude' | 'openai' | undefined {
   return model.startsWith('claude') ? 'claude' : 'openai';
 }
 
-function parseNaturalLanguageLlmCommand(
+function parseNaturalLanguagePrivateCommand(
   text: string,
 ): PrivateBridgeCommand | null {
   const trimmed = text.trim();
   if (!trimmed) return null;
+
+  const hasBotAccountTarget =
+    /(?:(?:qq|QQ|机器人|bot).*(?:账号|号|小号|分身)|(?:账号|号|小号|分身).*(?:qq|QQ|机器人|bot)|机器人账号|bot账号|qq账号|QQ账号|qq号|QQ号|agent|账号池)/.test(
+      trimmed,
+    );
+  const hasCreateVerb =
+    /(增加|新增|添加|加一个|加个|加上|接入|绑定|开通|准备一个|配一个|搞一个|整一个|再来一个|再加一个|多加一个)/.test(
+      trimmed,
+    );
+  const hasCreateIntent = /(想要|需要|想|要|希望|请|麻烦|帮我)/.test(trimmed);
+  const hasBotUseCase =
+    /(调度|协作|讨论|开会|机器人|bot|agent|账号池|多账号|多qq|多QQ)/.test(
+      trimmed,
+    );
+  if (
+    (hasCreateVerb || hasCreateIntent) &&
+    hasBotAccountTarget &&
+    hasBotUseCase
+  ) {
+    return { type: 'create-bot-account' };
+  }
+
+  const hasQrTarget = /(二维码|登录码|登录二维码|qr|qrcode|扫码)/i.test(
+    trimmed,
+  );
+  const hasRefreshVerb =
+    /(刷新|重发|重新发|重新生成|换一张|换个新的|来一张新的|再发一次|再来一张|更新一下|过期)/.test(
+      trimmed,
+    );
+  const hasRefreshContext =
+    /(机器人|bot|登录|账号)/.test(trimmed) ||
+    /(?:二维码|登录码).*(?:过期|失效)|(?:过期|失效).*(?:二维码|登录码)/.test(
+      trimmed,
+    );
+  if (hasQrTarget && hasRefreshVerb && hasRefreshContext) {
+    return { type: 'refresh-bot-account' };
+  }
 
   const hasQuestionIntent =
     /(比较|对比|区别|是什么意思|是什么|为什么|怎么|如何|能不能|可不可以|行不行|支持不支持|推荐|哪个好|哪一个)/.test(
@@ -342,7 +381,7 @@ function parsePrivateBridgeCommand(text: string): PrivateBridgeCommand | null {
     };
   }
 
-  return parseNaturalLanguageLlmCommand(trimmed);
+  return parseNaturalLanguagePrivateCommand(trimmed);
 }
 
 function getEffectiveLlmConfig(group: RegisteredGroup | undefined): {
@@ -383,10 +422,10 @@ function formatLlmStatusMessage(group: RegisteredGroup | undefined): string {
   }
 
   lines.push('');
-  lines.push('可用命令示例：');
-  lines.push('- 切换模型 openai gpt-5.4-pro');
-  lines.push('- 切换供应商 claude');
-  lines.push('- 恢复默认模型');
+  lines.push('你可以直接这样说：');
+  lines.push('- 以后这个私聊改用 openai 的 gpt-5.4-pro 来回复我');
+  lines.push('- 从现在开始这个会话切回 claude 吧');
+  lines.push('- 把这个私聊的模型配置恢复成默认吧');
 
   return lines.join('\n');
 }
@@ -688,6 +727,7 @@ export class QQBridgeChannel implements Channel {
   private messageIdOrder: string[] = [];
   private static readonly DEDUP_WINDOW = 1000;
   private static readonly LOGIN_TICKET_TTL_MS = 10 * 60 * 1000;
+  private static readonly LOGIN_TICKET_CONTEXT_TTL_MS = 30 * 60 * 1000;
 
   constructor(
     private readonly config: QQBridgeConfig,
@@ -707,10 +747,57 @@ export class QQBridgeChannel implements Channel {
   private cleanupLoginTickets(): void {
     const now = Date.now();
     for (const [ticketId, ticket] of this.loginTickets.entries()) {
-      if (Date.parse(ticket.expiresAt) <= now) {
+      const createdAt = Date.parse(ticket.createdAt);
+      const expiresAt = Date.parse(ticket.expiresAt);
+      const retentionDeadline = Math.max(
+        createdAt + QQBridgeChannel.LOGIN_TICKET_CONTEXT_TTL_MS,
+        expiresAt,
+      );
+      if (retentionDeadline <= now) {
         this.loginTickets.delete(ticketId);
       }
     }
+  }
+
+  private getRecentLoginTicketForChat(chatJid: string): LoginTicketView | null {
+    const now = Date.now();
+    let latest: LoginTicketView | null = null;
+
+    for (const ticket of this.loginTickets.values()) {
+      if (ticket.chatJid !== chatJid) continue;
+      const createdAt = Date.parse(ticket.createdAt);
+      if (Number.isNaN(createdAt)) continue;
+      if (now - createdAt > QQBridgeChannel.LOGIN_TICKET_CONTEXT_TTL_MS) {
+        continue;
+      }
+      if (!latest || createdAt > Date.parse(latest.createdAt)) {
+        latest = ticket;
+      }
+    }
+
+    return latest;
+  }
+
+  private inferContextualPrivateBridgeCommand(
+    chatJid: string,
+    content: string,
+  ): PrivateBridgeCommand | null {
+    const ticket = this.getRecentLoginTicketForChat(chatJid);
+    if (!ticket || ticket.lastState === 'success') {
+      return null;
+    }
+
+    const trimmed = content.trim();
+    if (!trimmed) return null;
+
+    const hasFollowupRefreshIntent =
+      /(失效|过期|扫不了|扫不出来|不能扫|没法扫|打不开|不行了|重发|再发|换一张|换个新的|重新来|重来|再给我一个|再来一个|刷新一下)/.test(
+        trimmed,
+      );
+
+    return hasFollowupRefreshIntent
+      ? { type: 'refresh-bot-account' }
+      : null;
   }
 
   private resolvePublicBaseUrl(): string | null {
@@ -747,7 +834,7 @@ export class QQBridgeChannel implements Channel {
           '✅ 已生成新的机器人登录二维码。',
           `会话ID：${event.ticketId}`,
           `二维码有效期至：${expiresAtText}`,
-          '如果二维码过期，请重新私聊发送“刷新机器人二维码”。',
+          '如果二维码过期，你可以直接说“二维码过期了，给我重新发一个新的机器人登录二维码”。',
         ];
         if (previewUrl) {
           lines.push(`备用预览地址：${previewUrl}`);
@@ -772,7 +859,7 @@ export class QQBridgeChannel implements Channel {
       case 'expired':
         return [
           '⌛ 二维码已过期。',
-          '请重新私聊发送“刷新机器人二维码”获取新的登录二维码。',
+          '你可以直接说“二维码过期了，给我重新发一个新的机器人登录二维码”。',
         ].join('\n');
       case 'failed':
         return `⚠️ 登录失败：${event.reason || '未知错误'}`;
@@ -789,6 +876,7 @@ export class QQBridgeChannel implements Channel {
     if (!ticket) {
       return;
     }
+    ticket.lastState = event.state;
     if (ticket.notifiedStates.has(event.state)) {
       return;
     }
@@ -833,6 +921,7 @@ export class QQBridgeChannel implements Channel {
         chatId,
         chatJid,
         notifiedStates: new Set<NapCatLoginLifecycleState>(),
+        lastState: 'qr_ready',
       });
       this.cleanupLoginTickets();
 
@@ -873,9 +962,15 @@ export class QQBridgeChannel implements Channel {
     chatType: 'private' | 'group';
     content: string;
   }): Promise<boolean> {
+    if (this.config.modelOwnsPrivateCommands) return false;
     if (payload.chatType !== 'private') return false;
 
-    const command = parsePrivateBridgeCommand(payload.content);
+    const command =
+      parsePrivateBridgeCommand(payload.content) ||
+      this.inferContextualPrivateBridgeCommand(
+        payload.chatJid,
+        payload.content,
+      );
     if (!command) return false;
 
     if (command.type === 'show-llm-status') {
@@ -1078,6 +1173,14 @@ export class QQBridgeChannel implements Channel {
     return this.dispatcher.enqueue({ kind: 'message', jid, text });
   }
 
+  async requestBotLoginTicket(chatJid: string): Promise<void> {
+    const parsed = parseQqJid(chatJid);
+    if (parsed.chatType !== 'private') {
+      throw new Error('Bot login tickets are only supported in private chats');
+    }
+    await this.sendBotLoginTicket(parsed.chatId, chatJid);
+  }
+
   setTyping(jid: string, isTyping: boolean): Promise<void> {
     return this.dispatcher.enqueue({ kind: 'typing', jid, isTyping });
   }
@@ -1110,6 +1213,12 @@ export class QQBridgeChannel implements Channel {
           response.statusCode = 404;
           response.setHeader('content-type', 'text/plain; charset=utf-8');
           response.end('QR ticket not found or expired');
+          return;
+        }
+        if (Date.parse(ticket.expiresAt) <= Date.now()) {
+          response.statusCode = 410;
+          response.setHeader('content-type', 'text/plain; charset=utf-8');
+          response.end('QR ticket expired');
           return;
         }
 
@@ -1461,6 +1570,7 @@ export function loadQQBridgeConfig(): QQBridgeConfig {
     'QQ_BRIDGE_SEND_JITTER_MS',
     'QQ_BRIDGE_MAX_RETRIES',
     'QQ_BRIDGE_BASE_BACKOFF_MS',
+    'QQ_BRIDGE_MODEL_OWNED_PRIVATE_COMMANDS',
   ]);
 
   return {
@@ -1522,6 +1632,11 @@ export function loadQQBridgeConfig(): QQBridgeConfig {
       process.env.QQ_BRIDGE_BASE_BACKOFF_MS || env.QQ_BRIDGE_BASE_BACKOFF_MS,
       2000,
       0,
+    ),
+    modelOwnsPrivateCommands: parseBoolean(
+      process.env.QQ_BRIDGE_MODEL_OWNED_PRIVATE_COMMANDS ||
+        env.QQ_BRIDGE_MODEL_OWNED_PRIVATE_COMMANDS,
+      true,
     ),
   };
 }

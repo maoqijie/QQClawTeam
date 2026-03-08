@@ -651,19 +651,26 @@ export class NapCatFleetManager {
       throw new Error('登录容器未暴露 WebUI 端口');
     }
 
-    await this.callWebUi(webUiPort, credential, '/api/QQLogin/RefreshQRcode', {});
-
     for (let attempt = 0; attempt < 20; attempt++) {
-      const response = await this.callWebUi<{ qrcode: string }>(
-        webUiPort,
-        credential,
-        '/api/QQLogin/GetQQLoginQrcode',
-        {},
-      );
+      try {
+        await this.callWebUi(webUiPort, credential, '/api/QQLogin/RefreshQRcode', {});
 
-      if (response.data?.qrcode) {
-        await this.emitPendingLoginEvent(instance, 'qr_ready');
-        return response.data.qrcode;
+        const response = await this.callWebUi<{ qrcode: string }>(
+          webUiPort,
+          credential,
+          '/api/QQLogin/GetQQLoginQrcode',
+          {},
+        );
+
+        if (response.data?.qrcode) {
+          await this.emitPendingLoginEvent(instance, 'qr_ready');
+          return response.data.qrcode;
+        }
+      } catch (err) {
+        logger.debug(
+          { err, webUiPort, attempt: attempt + 1 },
+          'Pending NapCat QR code not ready yet',
+        );
       }
 
       await sleep(1000);

@@ -8,6 +8,7 @@ import { readEnvFile } from './env.js';
 // where needed (container-runner.ts) to avoid leaking to child processes.
 const envConfig = readEnvFile([
   'ASSISTANT_NAME', 'ASSISTANT_HAS_OWN_NUMBER', 'LLM_BACKEND', 'OPENAI_MODEL',
+  'OPENAI_CONTEXT_WINDOW', 'OPENAI_AUTO_COMPACT_TOKEN_LIMIT',
   'QQ_GROUP_POOL_IDS', 'DISCUSSION_MAX_ROUNDS', 'DISCUSSION_TURN_TIMEOUT',
 ]);
 
@@ -68,6 +69,22 @@ export const LLM_BACKEND =
   process.env.LLM_BACKEND || envConfig.LLM_BACKEND || 'claude';
 export const OPENAI_MODEL =
   process.env.OPENAI_MODEL || envConfig.OPENAI_MODEL || DEFAULT_OPENAI_MODEL;
+export const OPENAI_CONTEXT_WINDOW = Math.max(
+  1,
+  parseInt(
+    process.env.OPENAI_CONTEXT_WINDOW || envConfig.OPENAI_CONTEXT_WINDOW || '1000000',
+    10,
+  ) || 1000000,
+);
+export const OPENAI_AUTO_COMPACT_TOKEN_LIMIT = Math.max(
+  1,
+  parseInt(
+    process.env.OPENAI_AUTO_COMPACT_TOKEN_LIMIT ||
+      envConfig.OPENAI_AUTO_COMPACT_TOKEN_LIMIT ||
+      String(Math.floor(OPENAI_CONTEXT_WINDOW * 0.9)),
+    10,
+  ) || Math.floor(OPENAI_CONTEXT_WINDOW * 0.9),
+);
 
 export const TRIGGER_PATTERN = new RegExp(
   `^@${escapeRegex(ASSISTANT_NAME)}\\b`,

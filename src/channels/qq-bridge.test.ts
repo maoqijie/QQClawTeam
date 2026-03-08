@@ -29,6 +29,7 @@ function createConfig(overrides: Partial<QQBridgeConfig> = {}): QQBridgeConfig {
     sendJitterMs: 0,
     maxRetries: 2,
     baseBackoffMs: 1,
+    modelOwnsPrivateCommands: false,
     ...overrides,
   };
 }
@@ -562,6 +563,76 @@ describe('QQBridgeChannel', () => {
     await channel.disconnect();
   });
 
+  it('handles natural language llm status and reset requests in private chat', async () => {
+    const { opts, messages, llmUpdates } = createOpts();
+    const channel = new QQBridgeChannel(createConfig(), opts, fetch);
+
+    const privateTexts: Array<{ userId: string; text: string }> = [];
+    channel.setFleetManager({
+      getMainConnector: () => ({
+        sendPrivateMsg: async (userId: string, text: string) => {
+          privateTexts.push({ userId, text });
+          return { retcode: 0, status: 'ok' };
+        },
+      }),
+    } as any);
+
+    await channel.connect();
+    const port = channel.getPort();
+
+    await fetch(`http://127.0.0.1:${port}/qq-bridge/inbound`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-qq-bridge-secret': 'test-secret',
+      },
+      body: JSON.stringify({
+        chat: { id: '1000', type: 'private', name: 'Alice' },
+        sender: { id: '2000', name: 'Alice' },
+        message: { text: '切换模型 openai gpt-5.4-pro' },
+      }),
+    });
+
+    await fetch(`http://127.0.0.1:${port}/qq-bridge/inbound`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-qq-bridge-secret': 'test-secret',
+      },
+      body: JSON.stringify({
+        chat: { id: '1000', type: 'private', name: 'Alice' },
+        sender: { id: '2000', name: 'Alice' },
+        message: { text: '你现在这个私聊用的是什么模型' },
+      }),
+    });
+
+    await fetch(`http://127.0.0.1:${port}/qq-bridge/inbound`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-qq-bridge-secret': 'test-secret',
+      },
+      body: JSON.stringify({
+        chat: { id: '1000', type: 'private', name: 'Alice' },
+        sender: { id: '2000', name: 'Alice' },
+        message: { text: '把这个私聊的模型配置恢复成默认吧' },
+      }),
+    });
+
+    expect(messages).toHaveLength(0);
+    expect(privateTexts).toHaveLength(3);
+    expect(privateTexts[1]?.text).toContain('当前私聊会话模型配置');
+    expect(privateTexts[1]?.text).toContain('gpt-5.4-pro');
+    expect(privateTexts[2]?.text).toContain('已恢复当前私聊会话的默认模型配置');
+    expect(getRegisteredGroup('qq:private:1000')?.containerConfig).toBeUndefined();
+    expect(llmUpdates.at(-1)).toEqual({
+      chatJid: 'qq:private:1000',
+      containerConfig: undefined,
+    });
+
+    await channel.disconnect();
+  });
+
   it('does not hijack normal comparison questions as llm switch commands', async () => {
     const { opts, messages, llmUpdates } = createOpts();
     const channel = new QQBridgeChannel(createConfig(), opts, fetch);
@@ -681,6 +752,221 @@ describe('QQBridgeChannel', () => {
     const qrBody = await qrResponse.text();
     expect(qrResponse.status).toBe(200);
     expect(qrBody).toContain('<svg');
+
+    await channel.disconnect();
+  });
+
+  it('handles natural language add-bot-account and refresh requests in private chat', async () => {
+    const { opts, messages } = createOpts();
+    const channel = new QQBridgeChannel(
+      createConfig({ publicBaseUrl: 'https://bot.example.com' }),
+      opts,
+      fetch,
+    );
+    const privateTexts: Array<{ userId: string; text: string }> = [];
+    const privateImages: Array<{ userId: string; base64: string }> = [];
+    let ticketNumber = 0;
+
+    channel.setFleetManager({
+      createAgentLoginTicket: async (options?: any) => {
+        ticketNumber += 1;
+        const createdAt = new Date().toISOString();
+        const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+        await options?.onEvent?.({
+          ticketId: `ticket-${ticketNumber}`,
+          state: 'qr_ready',
+          role: 'agent',
+          occurredAt: new Date(Date.now() + 1000).toISOString(),
+          createdAt,
+          expiresAt,
+        });
+        return {
+          id: `ticket-${ticketNumber}`,
+          role: 'agent',
+          qrCodeText: `https://example.com/login?token=${ticketNumber}`,
+          createdAt,
+          expiresAt,
+        };
+      },
+      getMainConnector: () => ({
+        sendPrivateMsg: async (userId: string, text: string) => {
+          privateTexts.push({ userId, text });
+          return { retcode: 0, status: 'ok' };
+        },
+        sendPrivateImageBase64: async (userId: string, base64: string) => {
+          privateImages.push({ userId, base64 });
+          return { retcode: 0, status: 'ok' };
+        },
+      }),
+    } as any);
+
+    await channel.connect();
+    const port = channel.getPort();
+
+    const createResponse = await fetch(`http://127.0.0.1:${port}/qq-bridge/inbound`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-qq-bridge-secret': 'test-secret',
+      },
+      body: JSON.stringify({
+        chat: { id: '1000', type: 'private', name: 'Alice' },
+        sender: { id: '2000', name: 'Alice' },
+        message: { text: '我想要增加一个QQ账号用于调度' },
+      }),
+    });
+
+    const refreshResponse = await fetch(`http://127.0.0.1:${port}/qq-bridge/inbound`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-qq-bridge-secret': 'test-secret',
+      },
+      body: JSON.stringify({
+        chat: { id: '1000', type: 'private', name: 'Alice' },
+        sender: { id: '2000', name: 'Alice' },
+        message: { text: '二维码过期了，给我重新发一个新的机器人登录二维码' },
+      }),
+    });
+
+    expect(createResponse.status).toBe(200);
+    expect(refreshResponse.status).toBe(200);
+    expect(messages).toHaveLength(0);
+    expect(privateTexts).toHaveLength(2);
+    expect(privateImages).toHaveLength(2);
+    expect(privateTexts[0]?.text).toContain('已生成新的机器人登录二维码');
+    expect(privateTexts[0]?.text).toContain(
+      '备用预览地址：https://bot.example.com/qq-bridge/bot-login/ticket-1',
+    );
+    expect(privateTexts[1]?.text).toContain('已生成新的机器人登录二维码');
+    expect(privateTexts[1]?.text).toContain(
+      '备用预览地址：https://bot.example.com/qq-bridge/bot-login/ticket-2',
+    );
+
+    await channel.disconnect();
+  });
+
+  it('uses recent login ticket context for short refresh follow-ups', async () => {
+    const { opts, messages } = createOpts();
+    const channel = new QQBridgeChannel(createConfig(), opts, fetch);
+    const privateTexts: Array<{ userId: string; text: string }> = [];
+    const privateImages: Array<{ userId: string; base64: string }> = [];
+    let ticketNumber = 0;
+
+    channel.setFleetManager({
+      createAgentLoginTicket: async (options?: any) => {
+        ticketNumber += 1;
+        const createdAt = new Date().toISOString();
+        const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+        await options?.onEvent?.({
+          ticketId: `ticket-${ticketNumber}`,
+          state: 'qr_ready',
+          role: 'agent',
+          occurredAt: new Date(Date.now() + 1000).toISOString(),
+          createdAt,
+          expiresAt,
+        });
+        return {
+          id: `ticket-${ticketNumber}`,
+          role: 'agent',
+          qrCodeText: `https://example.com/login?token=${ticketNumber}`,
+          createdAt,
+          expiresAt,
+        };
+      },
+      getMainConnector: () => ({
+        sendPrivateMsg: async (userId: string, text: string) => {
+          privateTexts.push({ userId, text });
+          return { retcode: 0, status: 'ok' };
+        },
+        sendPrivateImageBase64: async (userId: string, base64: string) => {
+          privateImages.push({ userId, base64 });
+          return { retcode: 0, status: 'ok' };
+        },
+      }),
+    } as any);
+
+    await channel.connect();
+    const port = channel.getPort();
+
+    await fetch(`http://127.0.0.1:${port}/qq-bridge/inbound`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-qq-bridge-secret': 'test-secret',
+      },
+      body: JSON.stringify({
+        chat: { id: '1000', type: 'private', name: 'Alice' },
+        sender: { id: '2000', name: 'Alice' },
+        message: { text: '我想要增加一个QQ账号用于调度' },
+      }),
+    });
+
+    await fetch(`http://127.0.0.1:${port}/qq-bridge/inbound`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-qq-bridge-secret': 'test-secret',
+      },
+      body: JSON.stringify({
+        chat: { id: '1000', type: 'private', name: 'Alice' },
+        sender: { id: '2000', name: 'Alice' },
+        message: { text: '失效了' },
+      }),
+    });
+
+    expect(messages).toHaveLength(0);
+    expect(privateTexts).toHaveLength(2);
+    expect(privateImages).toHaveLength(2);
+    expect(privateTexts[0]?.text).toContain('已生成新的机器人登录二维码');
+    expect(privateTexts[1]?.text).toContain('已生成新的机器人登录二维码');
+
+    await channel.disconnect();
+  });
+
+  it('does not intercept private commands when model-owned mode is enabled', async () => {
+    const { opts, messages } = createOpts();
+    const channel = new QQBridgeChannel(
+      createConfig({ modelOwnsPrivateCommands: true }),
+      opts,
+      fetch,
+    );
+
+    const privateTexts: Array<{ userId: string; text: string }> = [];
+    channel.setFleetManager({
+      getMainConnector: () => ({
+        sendPrivateMsg: async (userId: string, text: string) => {
+          privateTexts.push({ userId, text });
+          return { retcode: 0, status: 'ok' };
+        },
+      }),
+    } as any);
+
+    await channel.connect();
+    const port = channel.getPort();
+
+    const response = await fetch(`http://127.0.0.1:${port}/qq-bridge/inbound`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-qq-bridge-secret': 'test-secret',
+      },
+      body: JSON.stringify({
+        chat: { id: '1000', type: 'private', name: 'Alice' },
+        sender: { id: '2000', name: 'Alice' },
+        message: { text: '查看模型' },
+      }),
+    });
+
+    const body = (await response.json()) as {
+      accepted: boolean;
+      registered: boolean;
+    };
+    expect(response.status).toBe(200);
+    expect(body.accepted).toBe(true);
+    expect(body.registered).toBe(true);
+    expect(messages).toHaveLength(1);
+    expect(privateTexts).toHaveLength(0);
 
     await channel.disconnect();
   });

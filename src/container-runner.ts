@@ -12,6 +12,8 @@ import {
   CONTAINER_TIMEOUT,
   DATA_DIR,
   DEFAULT_OPENAI_BASE_URL,
+  OPENAI_AUTO_COMPACT_TOKEN_LIMIT,
+  OPENAI_CONTEXT_WINDOW,
   GROUPS_DIR,
   IDLE_TIMEOUT,
   TIMEZONE,
@@ -42,6 +44,8 @@ export interface ContainerInput {
   secrets?: Record<string, string>;
   llmBackend?: string;  // 'claude' | 'openai'
   llmModel?: string;    // e.g. 'gpt-4o', 'deepseek-chat'
+  openaiContextWindow?: number;
+  openaiAutoCompactTokenLimit?: number;
   teamTaskId?: string;  // For team workspace mount
 }
 
@@ -201,8 +205,20 @@ function buildVolumeMounts(
     group.folder,
     'agent-runner-src',
   );
-  if (!fs.existsSync(groupAgentRunnerDir) && fs.existsSync(agentRunnerSrc)) {
-    fs.cpSync(agentRunnerSrc, groupAgentRunnerDir, { recursive: true });
+  if (fs.existsSync(agentRunnerSrc)) {
+    const sourceEntrypoint = path.join(agentRunnerSrc, 'openai-runner.ts');
+    const targetEntrypoint = path.join(groupAgentRunnerDir, 'openai-runner.ts');
+    const shouldSyncRunnerSource =
+      !fs.existsSync(groupAgentRunnerDir) ||
+      !fs.existsSync(targetEntrypoint) ||
+      fs.statSync(sourceEntrypoint).mtimeMs > fs.statSync(targetEntrypoint).mtimeMs;
+
+    if (shouldSyncRunnerSource) {
+      fs.cpSync(agentRunnerSrc, groupAgentRunnerDir, {
+        recursive: true,
+        force: true,
+      });
+    }
   }
   mounts.push({
     hostPath: groupAgentRunnerDir,

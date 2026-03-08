@@ -15,6 +15,11 @@ export interface IpcDeps {
   sendMessage: (jid: string, text: string) => Promise<void>;
   registeredGroups: () => Record<string, RegisteredGroup>;
   registerGroup: (jid: string, group: RegisteredGroup) => void;
+  requestBotLoginTicket?: (chatJid: string) => Promise<void>;
+  updatePrivateLlmConfig?: (
+    chatJid: string,
+    containerConfig: RegisteredGroup['containerConfig'] | undefined,
+  ) => Promise<void> | void;
   syncGroups: (force: boolean) => Promise<void>;
   getAvailableGroups: () => AvailableGroup[];
   writeGroupsSnapshot: (
@@ -165,6 +170,8 @@ export async function processTaskIpc(
     context_mode?: string;
     groupFolder?: string;
     chatJid?: string;
+    llmBackend?: string;
+    llmModel?: string;
     targetJid?: string;
     // For register_group
     jid?: string;
@@ -181,6 +188,103 @@ export async function processTaskIpc(
   const registeredGroups = deps.registeredGroups();
 
   switch (data.type) {
+    case 'create_bot_login_ticket':
+    case 'refresh_bot_login_ticket':
+      if (data.chatJid && deps.requestBotLoginTicket) {
+        const targetGroup = registeredGroups[data.chatJid];
+        if (
+          targetGroup &&
+          targetGroup.folder === sourceGroup &&
+          data.chatJid.startsWith('qq:private:')
+        ) {
+          await deps.requestBotLoginTicket(data.chatJid);
+          logger.info(
+            { chatJid: data.chatJid, sourceGroup, type: data.type },
+            'Bot login ticket requested via IPC',
+          );
+        } else {
+          logger.warn(
+            { chatJid: data.chatJid, sourceGroup, type: data.type },
+            'Unauthorized bot login ticket request blocked',
+          );
+        }
+      }
+      break;
+
+    case 'set_private_llm_config':
+      if (data.chatJid && data.llmBackend && deps.updatePrivateLlmConfig) {
+        const targetGroup = registeredGroups[data.chatJid];
+        if (
+          targetGroup &&
+          targetGroup.folder === sourceGroup &&
+          data.chatJid.startsWith('qq:private:')
+        ) {
+          const nextContainerConfig: RegisteredGroup['containerConfig'] = {
+            ...(targetGroup.containerConfig || {}),
+            llmBackend: data.llmBackend as 'claude' | 'openai',
+            ...(data.llmBackend === 'openai' && data.llmModel
+              ? { llmModel: data.llmModel }
+              : {}),
+          };
+          await deps.updatePrivateLlmConfig(data.chatJid, nextContainerConfig);
+          logger.info(
+            {
+              chatJid: data.chatJid,
+              sourceGroup,
+              llmBackend: data.llmBackend,
+              llmModel: data.llmModel || null,
+            },
+            'Private LLM config updated via IPC',
+          );
+        } else {
+          logger.warn(
+            { chatJid: data.chatJid, sourceGroup },
+            'Unauthorized private LLM config update blocked',
+          );
+        }
+      }
+      break;
+
+    case 'reset_private_llm_config':
+      if (data.chatJid && deps.updatePrivateLlmConfig) {
+        const targetGroup = registeredGroups[data.chatJid];
+        if (
+          targetGroup &&
+          targetGroup.folder === sourceGroup &&
+          data.chatJid.startsWith('qq:private:')
+        ) {
+          const nextContainerConfig = targetGroup.containerConfig
+            ? {
+                ...targetGroup.containerConfig,
+                llmBackend: undefined,
+                llmModel: undefined,
+              }
+            : undefined;
+          const normalizedContainerConfig =
+            nextContainerConfig &&
+            (nextContainerConfig.additionalMounts?.length ||
+              nextContainerConfig.timeout !== undefined ||
+              nextContainerConfig.llmBackend !== undefined ||
+              nextContainerConfig.llmModel !== undefined)
+              ? nextContainerConfig
+              : undefined;
+          await deps.updatePrivateLlmConfig(
+            data.chatJid,
+            normalizedContainerConfig,
+          );
+          logger.info(
+            { chatJid: data.chatJid, sourceGroup },
+            'Private LLM config reset via IPC',
+          );
+        } else {
+          logger.warn(
+            { chatJid: data.chatJid, sourceGroup },
+            'Unauthorized private LLM config reset blocked',
+          );
+        }
+      }
+      break;
+
     case 'schedule_task':
       if (
         data.prompt &&

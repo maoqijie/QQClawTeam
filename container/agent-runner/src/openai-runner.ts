@@ -34,6 +34,8 @@ interface ContainerInput {
   secrets?: Record<string, string>;
   llmBackend?: string;
   llmModel?: string;
+  openaiContextWindow?: number;
+  openaiAutoCompactTokenLimit?: number;
 }
 
 interface ContainerOutput {
@@ -57,9 +59,10 @@ const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
 const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
 
 const MAX_TOOL_LOOPS = 50;
-const MAX_HISTORY_MESSAGES = 100;
 const DEFAULT_OPENAI_BASE_URL = 'https://new.fastaicode.top/v1';
 const DEFAULT_OPENAI_MODEL = 'gpt-5.4-pro';
+const DEFAULT_OPENAI_CONTEXT_WINDOW = 1000000;
+const DEFAULT_OPENAI_AUTO_COMPACT_TOKEN_LIMIT = 900000;
 
 interface ResponseApiOutputTextItem {
   type: 'output_text';
@@ -125,6 +128,37 @@ function log(message: string): void {
   console.error(`[openai-runner] ${message}`);
 }
 
+function estimateMessageTokens(messages: ChatCompletionMessageParam[]): number {
+  return Math.max(1, Math.ceil(JSON.stringify(messages).length / 4));
+}
+
+function compactMessagesToTokenBudget(
+  messages: ChatCompletionMessageParam[],
+  tokenBudget: number,
+): boolean {
+  if (messages.length <= 1) return false;
+
+  const systemMsg = messages[0];
+  let recentMessages = messages.slice(1);
+  let changed = false;
+
+  while (
+    recentMessages.length > 3 &&
+    estimateMessageTokens([systemMsg, ...recentMessages]) > tokenBudget
+  ) {
+    recentMessages = recentMessages.slice(1);
+    changed = true;
+  }
+
+  if (!changed) {
+    return false;
+  }
+
+  messages.length = 0;
+  messages.push(systemMsg, ...recentMessages);
+  return true;
+}
+
 function isStandardChatCompletionResponse(response: unknown): response is {
   choices: Array<{
     message: ChatCompletionAssistantMessageParam;
@@ -166,8 +200,16 @@ function extractTextFromResponseMessage(
 function normalizeAssistantTurn(
   response: unknown,
 ): NormalizedAssistantTurn | null {
-  if (isStandardChatCompletionResponse(response)) {
-    const choice = response.choices[0];
+  const chatChoices = Array.isArray(
+    (response as { choices?: unknown } | null | undefined)?.choices,
+  )
+    ? ((response as {
+        choices: Array<{ message: ChatCompletionAssistantMessageParam }>;
+      }).choices)
+    : null;
+
+  if (chatChoices) {
+    const choice = chatChoices[0];
     if (!choice) {
       return null;
     }
@@ -524,6 +566,67 @@ function buildToolDefinitions(isMain: boolean): ChatCompletionTool[] {
     },
   });
 
+  tools.push({
+    type: 'function',
+    function: {
+      name: 'show_private_llm_status',
+      description:
+        'Show the current private chat LLM backend/model configuration.',
+      parameters: { type: 'object', properties: {} },
+    },
+  });
+
+  tools.push({
+    type: 'function',
+    function: {
+      name: 'set_private_llm_config',
+      description:
+        'Set the current private chat LLM backend/model. Takes effect from the next user message.',
+      parameters: {
+        type: 'object',
+        properties: {
+          backend: { type: 'string', enum: ['claude', 'openai'] },
+          model: {
+            type: 'string',
+            description: 'Optional OpenAI-compatible model name when backend=openai',
+          },
+        },
+        required: ['backend'],
+      },
+    },
+  });
+
+  tools.push({
+    type: 'function',
+    function: {
+      name: 'reset_private_llm_config',
+      description:
+        'Reset the current private chat model configuration back to the global default.',
+      parameters: { type: 'object', properties: {} },
+    },
+  });
+
+  if (isMain) {
+    tools.push({
+      type: 'function',
+      function: {
+        name: 'create_bot_login_ticket',
+        description:
+          'Create a new bot login QR code and send it directly to the current private chat.',
+        parameters: { type: 'object', properties: {} },
+      },
+    });
+    tools.push({
+      type: 'function',
+      function: {
+        name: 'refresh_bot_login_ticket',
+        description:
+          'Refresh the bot login QR code and send a new one directly to the current private chat.',
+        parameters: { type: 'object', properties: {} },
+      },
+    });
+  }
+
   // schedule_task
   tools.push({
     type: 'function',
@@ -807,6 +910,67 @@ function executeTool(
 
   try {
     switch (name) {
+      case 'show_private_llm_status': {
+        if (!chatJid.startsWith('qq:private:')) {
+          return 'This tool is only available in private chats.';
+        }
+        return containerInput.llmBackend === 'openai'
+          ? `Current private chat LLM config\nBackend: openai\nModel: ${containerInput.llmModel || DEFAULT_OPENAI_MODEL}`
+          : 'Current private chat LLM config\nBackend: claude\nModel: Claude default runtime configuration';
+      }
+
+      case 'set_private_llm_config': {
+        if (!chatJid.startsWith('qq:private:')) {
+          return 'This tool is only available in private chats.';
+        }
+        writeIpcFile(TASKS_DIR, {
+          type: 'set_private_llm_config',
+          chatJid,
+          llmBackend: args.backend,
+          llmModel: args.model,
+          timestamp: new Date().toISOString(),
+        });
+        return args.backend === 'openai'
+          ? `Requested OpenAI-compatible backend for this private chat${args.model ? ` with model ${args.model}` : ''}. The change takes effect from the next user message.`
+          : 'Requested Claude backend for this private chat. The change takes effect from the next user message.';
+      }
+
+      case 'reset_private_llm_config': {
+        if (!chatJid.startsWith('qq:private:')) {
+          return 'This tool is only available in private chats.';
+        }
+        writeIpcFile(TASKS_DIR, {
+          type: 'reset_private_llm_config',
+          chatJid,
+          timestamp: new Date().toISOString(),
+        });
+        return 'Requested reset of the private chat model config. The change takes effect from the next user message.';
+      }
+
+      case 'create_bot_login_ticket': {
+        if (!isMain || !chatJid.startsWith('qq:private:')) {
+          return 'This tool is only available in the main private chat.';
+        }
+        writeIpcFile(TASKS_DIR, {
+          type: 'create_bot_login_ticket',
+          chatJid,
+          timestamp: new Date().toISOString(),
+        });
+        return 'Bot login QR creation requested. The QR code image will be sent directly to this private chat.';
+      }
+
+      case 'refresh_bot_login_ticket': {
+        if (!isMain || !chatJid.startsWith('qq:private:')) {
+          return 'This tool is only available in the main private chat.';
+        }
+        writeIpcFile(TASKS_DIR, {
+          type: 'refresh_bot_login_ticket',
+          chatJid,
+          timestamp: new Date().toISOString(),
+        });
+        return 'Bot login QR refresh requested. The new QR code image will be sent directly to this private chat.';
+      }
+
       case 'send_message': {
         const data: Record<string, string | undefined> = {
           type: 'message',
@@ -1092,6 +1256,9 @@ function buildSystemPrompt(
   parts.push(
     'You have access to tools for executing bash commands, reading/writing files, searching files and content, sending messages, and managing scheduled tasks.',
   );
+  parts.push(
+    'When the user asks to add a bot account, refresh a QR code, or view/change/reset the current private chat model config, decide the intent yourself and use the corresponding tools instead of asking the user to type rigid command phrases.',
+  );
   parts.push('Your working directory is /workspace/group.');
   parts.push(`Current time: ${new Date().toISOString()}`);
   parts.push(buildManualToolProtocol(tools));
@@ -1109,6 +1276,9 @@ async function runAgentLoop(
   containerInput: ContainerInput,
 ): Promise<string | null> {
   let loopCount = 0;
+  const autoCompactTokenLimit =
+    containerInput.openaiAutoCompactTokenLimit ||
+    DEFAULT_OPENAI_AUTO_COMPACT_TOKEN_LIMIT;
 
   while (loopCount < MAX_TOOL_LOOPS) {
     loopCount++;
@@ -1137,12 +1307,10 @@ async function runAgentLoop(
       // Context overflow: truncate history and retry
       if (apiErr.status === 400 && apiErr.error?.message?.includes('context')) {
         log('Context overflow, truncating history...');
-        // Keep system message + last few messages
-        if (messages.length > 4) {
-          const systemMsg = messages[0];
-          const recentMessages = messages.slice(-3);
-          messages.length = 0;
-          messages.push(systemMsg, ...recentMessages);
+        if (compactMessagesToTokenBudget(messages, autoCompactTokenLimit)) {
+          log(
+            `Compacted history after context overflow to ~${estimateMessageTokens(messages)} tokens`,
+          );
           continue;
         }
       }
@@ -1232,6 +1400,9 @@ export async function runOpenAIBackend(
   const baseURL =
     containerInput.secrets?.OPENAI_BASE_URL || DEFAULT_OPENAI_BASE_URL;
   const model = containerInput.llmModel || DEFAULT_OPENAI_MODEL;
+  const autoCompactTokenLimit =
+    containerInput.openaiAutoCompactTokenLimit ||
+    DEFAULT_OPENAI_AUTO_COMPACT_TOKEN_LIMIT;
 
   if (!apiKey) {
     writeOutput({
@@ -1287,13 +1458,12 @@ export async function runOpenAIBackend(
       // Add user message
       messages.push({ role: 'user', content: prompt });
 
-      // Truncate history if too long
-      if (messages.length > MAX_HISTORY_MESSAGES) {
-        const systemMsg = messages[0];
-        const recentMessages = messages.slice(-(MAX_HISTORY_MESSAGES - 1));
-        messages.length = 0;
-        messages.push(systemMsg, ...recentMessages);
-        log(`Truncated history to ${messages.length} messages`);
+      if (estimateMessageTokens(messages) > autoCompactTokenLimit) {
+        if (compactMessagesToTokenBudget(messages, autoCompactTokenLimit)) {
+          log(
+            `Compacted history to ~${estimateMessageTokens(messages)} tokens before querying`,
+          );
+        }
       }
 
       // Run agent loop

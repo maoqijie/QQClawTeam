@@ -5,6 +5,8 @@ import {
   ASSISTANT_NAME,
   IDLE_TIMEOUT,
   LLM_BACKEND,
+  OPENAI_AUTO_COMPACT_TOKEN_LIMIT,
+  OPENAI_CONTEXT_WINDOW,
   OPENAI_MODEL,
   POLL_INTERVAL,
   TIMEZONE,
@@ -375,6 +377,8 @@ async function runAgent(
         assistantName: ASSISTANT_NAME,
         llmBackend: effectiveBackend,
         llmModel: effectiveModel,
+        openaiContextWindow: OPENAI_CONTEXT_WINDOW,
+        openaiAutoCompactTokenLimit: OPENAI_AUTO_COMPACT_TOKEN_LIMIT,
       },
       (proc, containerName) =>
         queue.registerProcess(chatJid, proc, containerName, group.folder),
@@ -876,11 +880,20 @@ async function main(): Promise<void> {
     if (!channel) throw new Error(`No channel for JID: ${jid}`);
     return channel.sendMessage(jid, text);
   };
+  const ipcRequestBotLoginTicket = async (jid: string) => {
+    const channel = findChannel(channels, jid);
+    if (!(channel instanceof QQBridgeChannel)) {
+      throw new Error(`No QQ bridge channel for JID: ${jid}`);
+    }
+    await channel.requestBotLoginTicket(jid);
+  };
 
   startIpcWatcher({
     sendMessage: ipcSendMessage,
     registeredGroups: () => registeredGroups,
     registerGroup,
+    requestBotLoginTicket: ipcRequestBotLoginTicket,
+    updatePrivateLlmConfig: updatePrivateChatLlmConfig,
     syncGroups: async (force: boolean) => {
       await Promise.all(
         channels

@@ -30,6 +30,8 @@ interface ContainerInput {
   secrets?: Record<string, string>;
   llmBackend?: string;  // 'claude' | 'openai'
   llmModel?: string;    // e.g. 'gpt-5.4-pro', 'deepseek-chat'
+  openaiContextWindow?: number;
+  openaiAutoCompactTokenLimit?: number;
 }
 
 interface ContainerOutput {
@@ -448,6 +450,8 @@ async function runQuery(
             NANOCLAW_CHAT_JID: containerInput.chatJid,
             NANOCLAW_GROUP_FOLDER: containerInput.groupFolder,
             NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
+            NANOCLAW_LLM_BACKEND: containerInput.llmBackend || 'claude',
+            NANOCLAW_LLM_MODEL: containerInput.llmModel || '',
           },
         },
       },
@@ -511,6 +515,7 @@ async function runClaudeBackend(containerInput: ContainerInput): Promise<void> {
 
   // Build initial prompt (drain any pending IPC messages too)
   let prompt = containerInput.prompt;
+  prompt = `[Tooling note] When the user asks to add a bot account, refresh a QR code, or view/change/reset the current private chat model config, decide the intent yourself and use the available nanoclaw tools instead of asking for rigid command keywords.\n\n${prompt}`;
   if (containerInput.isScheduledTask) {
     prompt = `[SCHEDULED TASK - The following message was sent automatically and is not coming directly from the user or group.]\n\n${prompt}`;
   }
