@@ -48,6 +48,17 @@ OPENAI_MODEL=gpt-4o
 
 If you use an OpenAI-compatible provider, make sure it supports tool/function calling end-to-end. NanoClaw relies on tool calls for shell access, file edits, scheduled tasks, and admin actions.
 
+If you use the QQ private chat with the main bot account, you can switch the current DM session's runtime LLM directly from chat. The new setting applies on the next message:
+
+```text
+show model
+switch model openai gpt-5.4-pro
+switch provider claude
+reset model
+```
+
+These commands only affect the current private chat session, not every group or DM.
+
 ## Philosophy
 
 **Small enough to understand.** One process, a few source files and no microservices. If you want to understand the full NanoClaw codebase, just ask Claude Code to walk you through it.

@@ -36,6 +36,7 @@ function createConfig(overrides: Partial<QQBridgeConfig> = {}): QQBridgeConfig {
 function createOpts() {
   const groups: Record<string, any> = {};
   const messages: Array<{ chatJid: string; message: any }> = [];
+  const llmUpdates: Array<{ chatJid: string; containerConfig: any }> = [];
   const metadata: Array<{
     chatJid: string;
     timestamp: string;
@@ -58,10 +59,14 @@ function createOpts() {
         metadata.push({ chatJid, timestamp, name, channel, isGroup });
       },
       registeredGroups: () => groups,
+      onPrivateLlmConfigUpdated: (chatJid: string, containerConfig: any) => {
+        llmUpdates.push({ chatJid, containerConfig });
+      },
     },
     groups,
     messages,
     metadata,
+    llmUpdates,
   };
 }
 
@@ -334,6 +339,135 @@ describe('QQBridgeChannel', () => {
     await channel.disconnect();
   });
 
+  it('handles private llm switch command and persists chat override', async () => {
+    const { opts, messages, llmUpdates } = createOpts();
+    const channel = new QQBridgeChannel(createConfig(), opts, fetch);
+
+    const privateTexts: Array<{ userId: string; text: string }> = [];
+    channel.setFleetManager({
+      getMainConnector: () => ({
+        sendPrivateMsg: async (userId: string, text: string) => {
+          privateTexts.push({ userId, text });
+          return { retcode: 0, status: 'ok' };
+        },
+      }),
+    } as any);
+
+    await channel.connect();
+    const port = channel.getPort();
+
+    const response = await fetch(`http://127.0.0.1:${port}/qq-bridge/inbound`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-qq-bridge-secret': 'test-secret',
+      },
+      body: JSON.stringify({
+        chat: { id: '1000', type: 'private', name: 'Alice' },
+        sender: { id: '2000', name: 'Alice' },
+        message: { text: '切换模型 openai gpt-5.4-pro' },
+      }),
+    });
+
+    const body = (await response.json()) as {
+      accepted: boolean;
+      registered: boolean;
+    };
+    expect(response.status).toBe(200);
+    expect(body.accepted).toBe(true);
+    expect(body.registered).toBe(true);
+    expect(messages).toHaveLength(0);
+    expect(privateTexts).toHaveLength(1);
+    expect(privateTexts[0]?.text).toContain('已切换当前私聊会话的模型配置');
+    expect(privateTexts[0]?.text).toContain('gpt-5.4-pro');
+    expect(llmUpdates).toEqual([
+      {
+        chatJid: 'qq:private:1000',
+        containerConfig: {
+          llmBackend: 'openai',
+          llmModel: 'gpt-5.4-pro',
+        },
+      },
+    ]);
+
+    expect(getRegisteredGroup('qq:private:1000')?.containerConfig).toEqual({
+      llmBackend: 'openai',
+      llmModel: 'gpt-5.4-pro',
+    });
+
+    await channel.disconnect();
+  });
+
+  it('handles private llm status and reset commands', async () => {
+    const { opts, messages, llmUpdates } = createOpts();
+    const channel = new QQBridgeChannel(createConfig(), opts, fetch);
+
+    const privateTexts: Array<{ userId: string; text: string }> = [];
+    channel.setFleetManager({
+      getMainConnector: () => ({
+        sendPrivateMsg: async (userId: string, text: string) => {
+          privateTexts.push({ userId, text });
+          return { retcode: 0, status: 'ok' };
+        },
+      }),
+    } as any);
+
+    await channel.connect();
+    const port = channel.getPort();
+
+    await fetch(`http://127.0.0.1:${port}/qq-bridge/inbound`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-qq-bridge-secret': 'test-secret',
+      },
+      body: JSON.stringify({
+        chat: { id: '1000', type: 'private', name: 'Alice' },
+        sender: { id: '2000', name: 'Alice' },
+        message: { text: '切换模型 openai gpt-5.4-pro' },
+      }),
+    });
+
+    await fetch(`http://127.0.0.1:${port}/qq-bridge/inbound`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-qq-bridge-secret': 'test-secret',
+      },
+      body: JSON.stringify({
+        chat: { id: '1000', type: 'private', name: 'Alice' },
+        sender: { id: '2000', name: 'Alice' },
+        message: { text: '查看模型' },
+      }),
+    });
+
+    await fetch(`http://127.0.0.1:${port}/qq-bridge/inbound`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-qq-bridge-secret': 'test-secret',
+      },
+      body: JSON.stringify({
+        chat: { id: '1000', type: 'private', name: 'Alice' },
+        sender: { id: '2000', name: 'Alice' },
+        message: { text: '恢复默认模型' },
+      }),
+    });
+
+    expect(messages).toHaveLength(0);
+    expect(privateTexts).toHaveLength(3);
+    expect(privateTexts[1]?.text).toContain('当前私聊会话模型配置');
+    expect(privateTexts[1]?.text).toContain('gpt-5.4-pro');
+    expect(privateTexts[2]?.text).toContain('已恢复当前私聊会话的默认模型配置');
+    expect(getRegisteredGroup('qq:private:1000')?.containerConfig).toBeUndefined();
+    expect(llmUpdates.at(-1)).toEqual({
+      chatJid: 'qq:private:1000',
+      containerConfig: undefined,
+    });
+
+    await channel.disconnect();
+  });
+
   it('handles private add-bot-account command and returns qr ticket', async () => {
     const { opts, messages } = createOpts();
     const channel = new QQBridgeChannel(
@@ -341,6 +475,9 @@ describe('QQBridgeChannel', () => {
       opts,
       fetch,
     );
+    const createdAt = new Date().toISOString();
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+    const occurredAt = new Date(Date.now() + 1000).toISOString();
 
     const privateTexts: Array<{ userId: string; text: string }> = [];
     const privateImages: Array<{ userId: string; base64: string }> = [];
@@ -357,16 +494,16 @@ describe('QQBridgeChannel', () => {
         ticketId: 'ticket-1',
         state: 'qr_ready',
         role: 'agent',
-        occurredAt: '2026-03-07T23:50:01.000Z',
-        createdAt: '2026-03-07T23:50:00.000Z',
-        expiresAt: '2026-03-08T00:10:00.000Z',
+        occurredAt,
+        createdAt,
+        expiresAt,
       });
       return {
         id: 'ticket-1',
         role: 'agent',
         qrCodeText: 'https://example.com/login?token=abc',
-        createdAt: '2026-03-07T23:50:00.000Z',
-        expiresAt: '2026-03-08T00:10:00.000Z',
+        createdAt,
+        expiresAt,
       };
     };
 
@@ -428,6 +565,11 @@ describe('QQBridgeChannel', () => {
       opts,
       fetch,
     );
+    const createdAt = new Date().toISOString();
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+    const scannedAt = new Date(Date.now() + 60 * 1000).toISOString();
+    const scannedAgainAt = new Date(Date.now() + 65 * 1000).toISOString();
+    const successAt = new Date(Date.now() + 90 * 1000).toISOString();
 
     const privateTexts: Array<{ userId: string; text: string }> = [];
     const privateImages: Array<{ userId: string; base64: string }> = [];
@@ -460,8 +602,8 @@ describe('QQBridgeChannel', () => {
           id: 'ticket-1',
           role: 'agent',
           qrCodeText: 'https://example.com/login?token=abc',
-          createdAt: '2026-03-07T23:50:00.000Z',
-          expiresAt: '2026-03-08T00:10:00.000Z',
+          createdAt,
+          expiresAt,
         };
       },
       getMainConnector: () => ({
@@ -495,25 +637,25 @@ describe('QQBridgeChannel', () => {
       ticketId: 'ticket-1',
       state: 'scanned',
       role: 'agent',
-      occurredAt: '2026-03-07T23:51:00.000Z',
-      createdAt: '2026-03-07T23:50:00.000Z',
-      expiresAt: '2026-03-08T00:10:00.000Z',
+      occurredAt: scannedAt,
+      createdAt,
+      expiresAt,
     });
     await onEvent?.({
       ticketId: 'ticket-1',
       state: 'scanned',
       role: 'agent',
-      occurredAt: '2026-03-07T23:51:05.000Z',
-      createdAt: '2026-03-07T23:50:00.000Z',
-      expiresAt: '2026-03-08T00:10:00.000Z',
+      occurredAt: scannedAgainAt,
+      createdAt,
+      expiresAt,
     });
     await onEvent?.({
       ticketId: 'ticket-1',
       state: 'success',
       role: 'agent',
-      occurredAt: '2026-03-07T23:51:30.000Z',
-      createdAt: '2026-03-07T23:50:00.000Z',
-      expiresAt: '2026-03-08T00:10:00.000Z',
+      occurredAt: successAt,
+      createdAt,
+      expiresAt,
       qqAccount: '30001',
       nickname: 'Agent One',
     });

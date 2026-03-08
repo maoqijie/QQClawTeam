@@ -35,6 +35,7 @@ import {
   getRegisteredGroup,
   getRouterState,
   initDatabase,
+  deleteSession,
   setRegisteredGroup,
   setRouterState,
   setSession,
@@ -134,6 +135,37 @@ function registerGroup(jid: string, group: RegisteredGroup): void {
   logger.info(
     { jid, name: group.name, folder: group.folder },
     'Group registered',
+  );
+}
+
+function updatePrivateChatLlmConfig(
+  chatJid: string,
+  containerConfig: RegisteredGroup['containerConfig'],
+): void {
+  const existing = registeredGroups[chatJid];
+  if (!existing) {
+    throw new Error(`Chat ${chatJid} is not registered`);
+  }
+
+  const nextGroup: RegisteredGroup = {
+    ...existing,
+    containerConfig,
+  };
+
+  registeredGroups[chatJid] = nextGroup;
+  setRegisteredGroup(chatJid, nextGroup);
+  delete sessions[nextGroup.folder];
+  deleteSession(nextGroup.folder);
+  queue.closeStdin(chatJid);
+
+  logger.info(
+    {
+      chatJid,
+      folder: nextGroup.folder,
+      llmBackend: containerConfig?.llmBackend || null,
+      llmModel: containerConfig?.llmModel || null,
+    },
+    'Updated private chat LLM config',
   );
 }
 
@@ -329,6 +361,7 @@ async function runAgent(
     : undefined;
 
   const effectiveBackend = group.containerConfig?.llmBackend || LLM_BACKEND;
+  const effectiveModel = group.containerConfig?.llmModel || OPENAI_MODEL;
 
   try {
     const output = await runContainerAgent(
@@ -341,7 +374,7 @@ async function runAgent(
         isMain,
         assistantName: ASSISTANT_NAME,
         llmBackend: effectiveBackend,
-        llmModel: OPENAI_MODEL,
+        llmModel: effectiveModel,
       },
       (proc, containerName) =>
         queue.registerProcess(chatJid, proc, containerName, group.folder),
@@ -548,6 +581,12 @@ async function main(): Promise<void> {
       isGroup?: boolean,
     ) => storeChatMetadata(chatJid, timestamp, name, channel, isGroup),
     registeredGroups: () => registeredGroups,
+    onPrivateLlmConfigUpdated: (
+      chatJid: string,
+      containerConfig: RegisteredGroup['containerConfig'],
+    ) => {
+      updatePrivateChatLlmConfig(chatJid, containerConfig);
+    },
   };
 
   // Create and connect all registered channels.

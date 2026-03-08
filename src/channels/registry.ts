@@ -2,6 +2,7 @@ import {
   Channel,
   OnInboundMessage,
   OnChatMetadata,
+  ContainerConfig,
   RegisteredGroup,
 } from '../types.js';
 
@@ -9,6 +10,10 @@ export interface ChannelOpts {
   onMessage: OnInboundMessage;
   onChatMetadata: OnChatMetadata;
   registeredGroups: () => Record<string, RegisteredGroup>;
+  onPrivateLlmConfigUpdated?: (
+    chatJid: string,
+    containerConfig: ContainerConfig | undefined,
+  ) => Promise<void> | void;
 }
 
 export type ChannelFactory = (opts: ChannelOpts) => Channel | null;

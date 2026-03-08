@@ -5,7 +5,7 @@ import path from 'path';
 
 import { z } from 'zod';
 
-import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
+import { ASSISTANT_NAME, LLM_BACKEND, OPENAI_MODEL, TRIGGER_PATTERN } from '../config.js';
 import { setRegisteredGroup } from '../db.js';
 import { readEnvFile } from '../env.js';
 import { resolveGroupFolderPath } from '../group-folder.js';
@@ -27,7 +27,7 @@ import {
   mentionsBot,
   type OneBotMessageEvent,
 } from '../onebot-parser.js';
-import { Channel, RegisteredGroup } from '../types.js';
+import { Channel, ContainerConfig, RegisteredGroup } from '../types.js';
 import { ChannelOpts, registerChannel } from './registry.js';
 
 const inboundAttachmentSchema = z.object({
@@ -112,7 +112,16 @@ export interface QQBridgeRegistration {
 
 type FetchFn = typeof fetch;
 
-type PrivateBridgeCommand = 'create-bot-account' | 'refresh-bot-account';
+type PrivateBridgeCommand =
+  | { type: 'create-bot-account' }
+  | { type: 'refresh-bot-account' }
+  | { type: 'show-llm-status' }
+  | { type: 'reset-llm-config' }
+  | {
+      type: 'set-llm-config';
+      backend: 'claude' | 'openai';
+      model?: string;
+    };
 
 interface LoginTicketView {
   id: string;
@@ -199,7 +208,8 @@ function trimCommandPrefix(text: string, prefix: string): string {
 }
 
 function parsePrivateBridgeCommand(text: string): PrivateBridgeCommand | null {
-  const normalized = text.trim().toLowerCase().replace(/\s+/g, '');
+  const trimmed = text.trim();
+  const normalized = trimmed.toLowerCase().replace(/\s+/g, '');
   if (!normalized) return null;
 
   const createPatterns = [
@@ -212,12 +222,88 @@ function parsePrivateBridgeCommand(text: string): PrivateBridgeCommand | null {
   ];
 
   if (createPatterns.some((pattern) => pattern.test(normalized))) {
-    return 'create-bot-account';
+    return { type: 'create-bot-account' };
   }
   if (refreshPatterns.some((pattern) => pattern.test(normalized))) {
-    return 'refresh-bot-account';
+    return { type: 'refresh-bot-account' };
   }
+
+  const statusPatterns = [
+    /^\/?(?:查看|查询|当前)(?:模型|模型配置|供应商|llm)$/i,
+    /^\/?llm(?:status)?$/i,
+  ];
+  if (statusPatterns.some((pattern) => pattern.test(normalized))) {
+    return { type: 'show-llm-status' };
+  }
+
+  const resetPatterns = [
+    /^\/?(?:重置|恢复默认)(?:模型|模型配置|供应商|llm)$/i,
+    /^\/?reset-llm$/i,
+  ];
+  if (resetPatterns.some((pattern) => pattern.test(normalized))) {
+    return { type: 'reset-llm-config' };
+  }
+
+  const switchMatch = trimmed.match(
+    /^(?:\/)?(?:切换(?:模型|供应商|模型配置)?|切模型|切供应商|设置(?:模型|供应商|llm)?|set-llm|llm)\s*(?:为|到)?\s*(claude|openai)(?:\s+([^\s]+))?$/i,
+  );
+  if (switchMatch) {
+    const backend = switchMatch[1]?.toLowerCase() as 'claude' | 'openai';
+    const model = switchMatch[2]?.trim();
+    return {
+      type: 'set-llm-config',
+      backend,
+      ...(model ? { model } : {}),
+    };
+  }
+
   return null;
+}
+
+function getEffectiveLlmConfig(group: RegisteredGroup | undefined): {
+  backend: 'claude' | 'openai';
+  model: string;
+  backendSource: 'chat' | 'global';
+  modelSource: 'chat' | 'global';
+} {
+  const backend = group?.containerConfig?.llmBackend || LLM_BACKEND;
+  const model = group?.containerConfig?.llmModel || OPENAI_MODEL;
+
+  return {
+    backend: backend === 'openai' ? 'openai' : 'claude',
+    model,
+    backendSource: group?.containerConfig?.llmBackend ? 'chat' : 'global',
+    modelSource: group?.containerConfig?.llmModel ? 'chat' : 'global',
+  };
+}
+
+function formatLlmStatusMessage(group: RegisteredGroup | undefined): string {
+  const status = getEffectiveLlmConfig(group);
+  const lines = [
+    '当前私聊会话模型配置：',
+    `- 供应商：${status.backend}${status.backendSource === 'chat' ? '（当前会话覆盖）' : '（全局默认）'}`,
+  ];
+
+  if (status.backend === 'openai') {
+    lines.push(
+      `- 模型：${status.model}${status.modelSource === 'chat' ? '（当前会话覆盖）' : '（全局默认）'}`,
+    );
+  } else {
+    lines.push('- 模型：Claude 默认运行配置');
+    if (group?.containerConfig?.llmModel) {
+      lines.push(
+        `- 已记住的 OpenAI 模型：${group.containerConfig.llmModel}（切回 openai 时会继续使用）`,
+      );
+    }
+  }
+
+  lines.push('');
+  lines.push('可用命令示例：');
+  lines.push('- 切换模型 openai gpt-5.4-pro');
+  lines.push('- 切换供应商 claude');
+  lines.push('- 恢复默认模型');
+
+  return lines.join('\n');
 }
 
 export function toQqJid(chatType: 'private' | 'group', chatId: string): string {
@@ -707,6 +793,94 @@ export class QQBridgeChannel implements Channel {
     const command = parsePrivateBridgeCommand(payload.content);
     if (!command) return false;
 
+    if (command.type === 'show-llm-status') {
+      await this.sendMessage(
+        payload.chatJid,
+        formatLlmStatusMessage(this.opts.registeredGroups()[payload.chatJid]),
+      );
+      return true;
+    }
+
+    if (command.type === 'reset-llm-config') {
+      const currentGroup = this.opts.registeredGroups()[payload.chatJid];
+      if (!currentGroup) {
+        await this.sendMessage(payload.chatJid, '⚠️ 当前私聊尚未注册，暂时无法重置模型配置。');
+        return true;
+      }
+
+      const nextContainerConfig: ContainerConfig | undefined = currentGroup.containerConfig
+        ? {
+            ...currentGroup.containerConfig,
+            llmBackend: undefined,
+            llmModel: undefined,
+          }
+        : undefined;
+      const normalizedContainerConfig = nextContainerConfig &&
+        (nextContainerConfig.additionalMounts?.length ||
+          nextContainerConfig.timeout !== undefined ||
+          nextContainerConfig.llmBackend !== undefined ||
+          nextContainerConfig.llmModel !== undefined)
+        ? nextContainerConfig
+        : undefined;
+      const nextGroup: RegisteredGroup = {
+        ...currentGroup,
+        containerConfig: normalizedContainerConfig,
+      };
+
+      this.opts.registeredGroups()[payload.chatJid] = nextGroup;
+      setRegisteredGroup(payload.chatJid, nextGroup);
+      await this.opts.onPrivateLlmConfigUpdated?.(
+        payload.chatJid,
+        nextGroup.containerConfig,
+      );
+      await this.sendMessage(
+        payload.chatJid,
+        `✅ 已恢复当前私聊会话的默认模型配置。\n\n${formatLlmStatusMessage(nextGroup)}\n\n新设置从下一条消息开始生效。`,
+      );
+      return true;
+    }
+
+    if (command.type === 'set-llm-config') {
+      const currentGroup = this.opts.registeredGroups()[payload.chatJid];
+      if (!currentGroup) {
+        await this.sendMessage(payload.chatJid, '⚠️ 当前私聊尚未注册，暂时无法切换模型配置。');
+        return true;
+      }
+
+      const nextContainerConfig: ContainerConfig = {
+        ...(currentGroup.containerConfig || {}),
+        llmBackend: command.backend,
+        ...(command.backend === 'openai' && command.model
+          ? { llmModel: command.model }
+          : {}),
+      };
+      const nextGroup: RegisteredGroup = {
+        ...currentGroup,
+        containerConfig: nextContainerConfig,
+      };
+
+      this.opts.registeredGroups()[payload.chatJid] = nextGroup;
+      setRegisteredGroup(payload.chatJid, nextGroup);
+      await this.opts.onPrivateLlmConfigUpdated?.(
+        payload.chatJid,
+        nextGroup.containerConfig,
+      );
+
+      const modelNote = command.backend === 'claude'
+        ? command.model
+          ? '\n\n⚠️ Claude 后端当前不支持通过该命令指定模型，已仅切换供应商。'
+          : ''
+        : command.model
+          ? ''
+          : '\n\n未指定模型，已保留当前会话已有模型；如果之前没有覆盖，则继续使用全局默认模型。';
+
+      await this.sendMessage(
+        payload.chatJid,
+        `✅ 已切换当前私聊会话的模型配置。\n\n${formatLlmStatusMessage(nextGroup)}${modelNote}\n\n新设置从下一条消息开始生效。`,
+      );
+      return true;
+    }
+
     if (!this.fleetManager) {
       await this.sendMessage(
         payload.chatJid,
@@ -715,7 +889,10 @@ export class QQBridgeChannel implements Channel {
       return true;
     }
 
-    if (command === 'create-bot-account' || command === 'refresh-bot-account') {
+    if (
+      command.type === 'create-bot-account' ||
+      command.type === 'refresh-bot-account'
+    ) {
       await this.sendBotLoginTicket(payload.chatId, payload.chatJid);
       return true;
     }
