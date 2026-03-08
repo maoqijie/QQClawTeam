@@ -21,7 +21,11 @@ export interface GroupPoolDb {
   getGroupPool(groupId: string): GroupPoolEntry | undefined;
   getAllGroupPool(): GroupPoolEntry[];
   upsertGroupPool(entry: GroupPoolEntry): void;
-  updateGroupPoolStatus(groupId: string, status: GroupPoolEntry['status'], taskId: string | null): void;
+  updateGroupPoolStatus(
+    groupId: string,
+    status: GroupPoolEntry['status'],
+    taskId: string | null,
+  ): void;
 }
 
 export class GroupPoolManager {
@@ -30,6 +34,7 @@ export class GroupPoolManager {
   constructor(
     private readonly db: GroupPoolDb,
     private readonly fleetManager: NapCatFleetManager | null,
+    private readonly configuredGroupIds: string[] = QQ_GROUP_POOL_IDS,
   ) {}
 
   /**
@@ -44,7 +49,7 @@ export class GroupPoolManager {
 
     // Add configured groups that aren't in DB yet
     const now = new Date().toISOString();
-    for (const groupId of QQ_GROUP_POOL_IDS) {
+    for (const groupId of this.configuredGroupIds) {
       if (!this.pool.has(groupId)) {
         const entry: GroupPoolEntry = {
           qqGroupId: groupId,

@@ -1,4 +1,4 @@
-import { execSync } from 'child_process';
+import { execFileSync, execSync } from 'child_process';
 import crypto from 'crypto';
 import fs from 'fs';
 import os from 'os';
@@ -33,6 +33,50 @@ import {
   runNpmInstall,
 } from './structured.js';
 import { ApplyResult } from './types.js';
+
+function resolveWindowsShell(): { command: string; args: string[] } {
+  const gitShellCandidates = [
+    process.env['GIT_SH_EXE'],
+    process.env['ProgramFiles']
+      ? path.join(process.env['ProgramFiles'], 'Git', 'bin', 'sh.exe')
+      : null,
+    process.env['ProgramFiles']
+      ? path.join(process.env['ProgramFiles'], 'Git', 'usr', 'bin', 'sh.exe')
+      : null,
+    process.env['ProgramW6432']
+      ? path.join(process.env['ProgramW6432'], 'Git', 'bin', 'sh.exe')
+      : null,
+    process.env['ProgramW6432']
+      ? path.join(process.env['ProgramW6432'], 'Git', 'usr', 'bin', 'sh.exe')
+      : null,
+  ].filter((candidate): candidate is string => Boolean(candidate));
+
+  for (const candidate of gitShellCandidates) {
+    if (fs.existsSync(candidate)) {
+      return { command: candidate, args: ['-lc'] };
+    }
+  }
+
+  return { command: process.env.ComSpec || 'cmd.exe', args: ['/d', '/s', '/c'] };
+}
+
+function runProjectCommand(command: string, cwd: string): void {
+  if (process.platform === 'win32') {
+    const shell = resolveWindowsShell();
+    execFileSync(shell.command, [...shell.args, command], {
+      stdio: 'pipe',
+      cwd,
+      timeout: 120_000,
+    });
+    return;
+  }
+
+  execSync(command, {
+    stdio: 'pipe',
+    cwd,
+    timeout: 120_000,
+  });
+}
 
 export async function applySkill(skillDir: string): Promise<ApplyResult> {
   const projectRoot = process.cwd();
@@ -275,7 +319,7 @@ export async function applySkill(skillDir: string): Promise<ApplyResult> {
     if (manifest.post_apply && manifest.post_apply.length > 0) {
       for (const cmd of manifest.post_apply) {
         try {
-          execSync(cmd, { stdio: 'pipe', cwd: projectRoot, timeout: 120_000 });
+          runProjectCommand(cmd, projectRoot);
         } catch (postErr: any) {
           // Rollback on post_apply failure
           for (const f of addedFiles) {
@@ -325,11 +369,7 @@ export async function applySkill(skillDir: string): Promise<ApplyResult> {
     // --- Bug 3 fix: Execute test command if defined ---
     if (manifest.test) {
       try {
-        execSync(manifest.test, {
-          stdio: 'pipe',
-          cwd: projectRoot,
-          timeout: 120_000,
-        });
+        runProjectCommand(manifest.test, projectRoot);
       } catch (testErr: any) {
         // Tests failed — remove added files, restore backup and undo state
         for (const f of addedFiles) {

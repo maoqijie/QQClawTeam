@@ -1,4 +1,4 @@
-import { execFileSync } from 'child_process';
+import { execFileSync, execSync } from 'child_process';
 import crypto from 'crypto';
 import fs from 'fs';
 import os from 'os';
@@ -12,6 +12,87 @@ import { mergeFile } from './merge.js';
 import { computeFileHash, readState, writeState } from './state.js';
 import type { RebaseResult } from './types.js';
 
+function toPortableRelativePath(relativePath: string): string {
+  return relativePath.split(path.sep).join('/');
+}
+
+function diffCommandExists(): boolean {
+  try {
+    execSync(process.platform === 'win32' ? 'where diff' : 'command -v diff', {
+      stdio: 'ignore',
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function getEmptyDiffPlaceholder(projectRoot: string): string {
+  const placeholderPath = path.join(
+    projectRoot,
+    NANOCLAW_DIR,
+    '.empty-diff-placeholder',
+  );
+
+  if (!fs.existsSync(placeholderPath)) {
+    fs.mkdirSync(path.dirname(placeholderPath), { recursive: true });
+    fs.writeFileSync(placeholderPath, '', 'utf-8');
+  }
+
+  return placeholderPath;
+}
+
+function runUnifiedDiff(
+  oldPath: string | null,
+  newPath: string | null,
+  relativePath: string,
+  projectRoot: string,
+): string {
+  const oldExists = oldPath !== null && fs.existsSync(oldPath);
+  const newExists = newPath !== null && fs.existsSync(newPath);
+
+  const emptyFilePath = getEmptyDiffPlaceholder(projectRoot);
+  const safeOldPath = oldExists ? oldPath : emptyFilePath;
+  const safeNewPath = newExists ? newPath : emptyFilePath;
+
+  if (diffCommandExists()) {
+    try {
+      return execFileSync('diff', ['-ruN', safeOldPath, safeNewPath], {
+        encoding: 'utf-8',
+      });
+    } catch (err: unknown) {
+      const execErr = err as { status?: number; stdout?: string };
+      if (execErr.status === 1 && execErr.stdout) {
+        return execErr.stdout;
+      }
+      if (execErr.status === 2) {
+        throw new Error(
+          `diff error for ${relativePath}: diff exited with status 2`,
+        );
+      }
+      throw err;
+    }
+  }
+
+  try {
+    return execFileSync(
+      'git',
+      ['diff', '--no-index', '--binary', safeOldPath, safeNewPath],
+      {
+        encoding: 'utf-8',
+      },
+    );
+  } catch (err: unknown) {
+    const execErr = err as { status?: number; stdout?: string };
+    if (execErr.status === 1 && execErr.stdout) {
+      return execErr.stdout;
+    }
+    throw new Error(
+      `diff error for ${relativePath}: git diff failed${execErr.status ? ` with status ${execErr.status}` : ''}`,
+    );
+  }
+}
+
 function walkDir(dir: string, root: string): string[] {
   const results: string[] = [];
   if (!fs.existsSync(dir)) return results;
@@ -21,7 +102,7 @@ function walkDir(dir: string, root: string): string[] {
     if (entry.isDirectory()) {
       results.push(...walkDir(fullPath, root));
     } else {
-      results.push(path.relative(root, fullPath));
+      results.push(toPortableRelativePath(path.relative(root, fullPath)));
     }
   }
   return results;
@@ -32,14 +113,14 @@ function collectTrackedFiles(state: ReturnType<typeof readState>): Set<string> {
 
   for (const skill of state.applied_skills) {
     for (const relPath of Object.keys(skill.file_hashes)) {
-      tracked.add(relPath);
+      tracked.add(toPortableRelativePath(relPath));
     }
   }
 
   if (state.custom_modifications) {
     for (const mod of state.custom_modifications) {
       for (const relPath of mod.files_modified) {
-        tracked.add(relPath);
+        tracked.add(toPortableRelativePath(relPath));
       }
     }
   }
@@ -92,27 +173,15 @@ export async function rebase(newBasePath?: string): Promise<RebaseResult> {
         const basePath = path.join(baseAbsDir, relPath);
         const workingPath = path.join(projectRoot, relPath);
 
-        const oldPath = fs.existsSync(basePath) ? basePath : '/dev/null';
-        const newPath = fs.existsSync(workingPath) ? workingPath : '/dev/null';
+        const oldPath = fs.existsSync(basePath) ? basePath : null;
+        const newPath = fs.existsSync(workingPath) ? workingPath : null;
 
-        if (oldPath === '/dev/null' && newPath === '/dev/null') continue;
+        if (oldPath === null && newPath === null) continue;
 
-        try {
-          const diff = execFileSync('diff', ['-ruN', oldPath, newPath], {
-            encoding: 'utf-8',
-          });
-          if (diff.trim()) {
-            combinedPatch += diff;
-            filesInPatch++;
-          }
-        } catch (err: unknown) {
-          const execErr = err as { status?: number; stdout?: string };
-          if (execErr.status === 1 && execErr.stdout) {
-            combinedPatch += execErr.stdout;
-            filesInPatch++;
-          } else {
-            throw err;
-          }
+        const diff = runUnifiedDiff(oldPath, newPath, relPath, projectRoot);
+        if (diff.trim()) {
+          combinedPatch += diff;
+          filesInPatch++;
         }
       }
 

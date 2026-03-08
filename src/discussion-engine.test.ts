@@ -8,11 +8,7 @@ import {
   getDiscussionMessages,
   getDiscussionByGroup,
 } from './db.js';
-import {
-  createTeamTask,
-  getTeamTask,
-  createAgentAssignment,
-} from './db.js';
+import { createTeamTask, getTeamTask, createAgentAssignment } from './db.js';
 import {
   getAllGroupPool,
   upsertGroupPool,
@@ -20,7 +16,10 @@ import {
   getGroupPool,
 } from './db.js';
 import { GroupPoolManager } from './group-pool.js';
-import type { DiscussionState, DiscussionMessage } from './discussion-engine.js';
+import type {
+  DiscussionState,
+  DiscussionMessage,
+} from './discussion-engine.js';
 
 describe('discussion DB operations', () => {
   beforeEach(() => {
@@ -215,12 +214,20 @@ describe('group pool DB operations', () => {
 
   it('lists all pool entries', () => {
     upsertGroupPool({
-      qqGroupId: 'g1', status: 'available', currentTaskId: null,
-      memberAccounts: [], createdAt: '2026-03-07T00:00:00Z', updatedAt: '2026-03-07T00:00:00Z',
+      qqGroupId: 'g1',
+      status: 'available',
+      currentTaskId: null,
+      memberAccounts: [],
+      createdAt: '2026-03-07T00:00:00Z',
+      updatedAt: '2026-03-07T00:00:00Z',
     });
     upsertGroupPool({
-      qqGroupId: 'g2', status: 'in_use', currentTaskId: 'tt-x',
-      memberAccounts: [], createdAt: '2026-03-07T00:00:00Z', updatedAt: '2026-03-07T00:00:00Z',
+      qqGroupId: 'g2',
+      status: 'in_use',
+      currentTaskId: 'tt-x',
+      memberAccounts: [],
+      createdAt: '2026-03-07T00:00:00Z',
+      updatedAt: '2026-03-07T00:00:00Z',
     });
 
     const all = getAllGroupPool();
@@ -242,16 +249,25 @@ describe('GroupPoolManager', () => {
         updateGroupPoolStatus,
       },
       null,
+      [],
     );
 
     // Manually add groups to pool
     upsertGroupPool({
-      qqGroupId: 'pool-1', status: 'available', currentTaskId: null,
-      memberAccounts: [], createdAt: '2026-03-07T00:00:00Z', updatedAt: '2026-03-07T00:00:00Z',
+      qqGroupId: 'pool-1',
+      status: 'available',
+      currentTaskId: null,
+      memberAccounts: [],
+      createdAt: '2026-03-07T00:00:00Z',
+      updatedAt: '2026-03-07T00:00:00Z',
     });
     upsertGroupPool({
-      qqGroupId: 'pool-2', status: 'available', currentTaskId: null,
-      memberAccounts: [], createdAt: '2026-03-07T00:00:00Z', updatedAt: '2026-03-07T00:00:00Z',
+      qqGroupId: 'pool-2',
+      status: 'available',
+      currentTaskId: null,
+      memberAccounts: [],
+      createdAt: '2026-03-07T00:00:00Z',
+      updatedAt: '2026-03-07T00:00:00Z',
     });
 
     await manager.syncGroupPool();
@@ -277,6 +293,7 @@ describe('GroupPoolManager', () => {
         updateGroupPoolStatus,
       },
       null,
+      [],
     );
 
     await manager.syncGroupPool();

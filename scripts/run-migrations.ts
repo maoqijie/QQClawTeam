@@ -2,23 +2,48 @@
 import { execFileSync, execSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
 
 import { compareSemver } from '../skills-engine/state.js';
 
-// Resolve tsx binary once to avoid npx race conditions across migrations
-function resolveTsx(): string {
-  // Check local node_modules first
-  const local = path.resolve('node_modules/.bin/tsx');
-  if (fs.existsSync(local)) return local;
-  // Fall back to whichever tsx is in PATH
-  try {
-    return execSync('which tsx', { encoding: 'utf-8' }).trim();
-  } catch {
-    return 'npx'; // last resort
-  }
+const scriptDir = path.dirname(fileURLToPath(import.meta.url));
+
+interface TsxCommand {
+  command: string;
+  prefixArgs: string[];
 }
 
-const tsxBin = resolveTsx();
+// Resolve tsx runner once to avoid npx race conditions across migrations
+function resolveTsx(): TsxCommand {
+  const localCli = path.resolve(scriptDir, '../node_modules/tsx/dist/cli.mjs');
+  if (fs.existsSync(localCli)) {
+    return {
+      command: process.execPath,
+      prefixArgs: [localCli],
+    };
+  }
+
+  try {
+    const lookupCommand =
+      process.platform === 'win32' ? 'where tsx' : 'which tsx';
+    const resolved = execSync(lookupCommand, { encoding: 'utf-8' })
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .find(Boolean);
+    if (resolved) {
+      return { command: resolved, prefixArgs: [] };
+    }
+  } catch {
+    // ignore and fall back to npx
+  }
+
+  return {
+    command: process.platform === 'win32' ? 'npx.cmd' : 'npx',
+    prefixArgs: ['tsx'],
+  };
+}
+
+const tsxCommand = resolveTsx();
 
 const fromVersion = process.argv[2];
 const toVersion = process.argv[3];
@@ -72,14 +97,15 @@ for (const version of migrationVersions) {
   }
 
   try {
-    const tsxArgs = tsxBin.endsWith('npx')
-      ? ['tsx', migrationIndex, projectRoot]
-      : [migrationIndex, projectRoot];
-    execFileSync(tsxBin, tsxArgs, {
-      stdio: 'pipe',
-      cwd: projectRoot,
-      timeout: 120_000,
-    });
+    execFileSync(
+      tsxCommand.command,
+      [...tsxCommand.prefixArgs, migrationIndex, projectRoot],
+      {
+        stdio: 'pipe',
+        cwd: projectRoot,
+        timeout: 120_000,
+      },
+    );
     results.push({ version, success: true });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

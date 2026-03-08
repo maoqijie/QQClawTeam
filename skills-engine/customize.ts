@@ -17,6 +17,84 @@ interface PendingCustomize {
   file_hashes: Record<string, string>;
 }
 
+function diffCommandExists(): boolean {
+  try {
+    execSync(process.platform === 'win32' ? 'where diff' : 'command -v diff', {
+      stdio: 'ignore',
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function runUnifiedDiff(
+  oldPath: string,
+  newPath: string,
+  relativePath: string,
+): string {
+  const oldExists = oldPath !== '/dev/null' && fs.existsSync(oldPath);
+  const newExists = newPath !== '/dev/null' && fs.existsSync(newPath);
+
+  if (
+    (oldExists && fs.statSync(oldPath).isDirectory()) ||
+    (newExists && fs.statSync(newPath).isDirectory())
+  ) {
+    throw new Error(
+      `diff error for ${relativePath}: cannot diff a directory path`,
+    );
+  }
+
+  const emptyFilePath = path.join(
+    process.cwd(),
+    CUSTOM_DIR,
+    '.empty-diff-placeholder',
+  );
+  if (!fs.existsSync(emptyFilePath)) {
+    fs.writeFileSync(emptyFilePath, '', 'utf-8');
+  }
+
+  const safeOldPath = oldExists ? oldPath : emptyFilePath;
+  const safeNewPath = newExists ? newPath : emptyFilePath;
+
+  if (diffCommandExists()) {
+    try {
+      return execFileSync('diff', ['-ruN', safeOldPath, safeNewPath], {
+        encoding: 'utf-8',
+      });
+    } catch (err: unknown) {
+      const execErr = err as { status?: number; stdout?: string };
+      if (execErr.status === 1 && execErr.stdout) {
+        return execErr.stdout;
+      }
+      if (execErr.status === 2) {
+        throw new Error(
+          `diff error for ${relativePath}: diff exited with status 2 (check file permissions or encoding)`,
+        );
+      }
+      throw err;
+    }
+  }
+
+  try {
+    return execFileSync(
+      'git',
+      ['diff', '--no-index', '--binary', safeOldPath, safeNewPath],
+      {
+        encoding: 'utf-8',
+      },
+    );
+  } catch (err: unknown) {
+    const execErr = err as { status?: number; stdout?: string };
+    if (execErr.status === 1 && execErr.stdout) {
+      return execErr.stdout;
+    }
+    throw new Error(
+      `diff error for ${relativePath}: git diff failed${execErr.status ? ` with status ${execErr.status}` : ''}`,
+    );
+  }
+}
+
 function getPendingPath(): string {
   return path.join(process.cwd(), CUSTOM_DIR, 'pending.yaml');
 }
@@ -99,24 +177,7 @@ export function commitCustomize(): void {
     const oldPath = fs.existsSync(basePath) ? basePath : '/dev/null';
     const newPath = fs.existsSync(currentPath) ? currentPath : '/dev/null';
 
-    try {
-      const diff = execFileSync('diff', ['-ruN', oldPath, newPath], {
-        encoding: 'utf-8',
-      });
-      combinedPatch += diff;
-    } catch (err: unknown) {
-      const execErr = err as { status?: number; stdout?: string };
-      if (execErr.status === 1 && execErr.stdout) {
-        // diff exits 1 when files differ — that's expected
-        combinedPatch += execErr.stdout;
-      } else if (execErr.status === 2) {
-        throw new Error(
-          `diff error for ${relativePath}: diff exited with status 2 (check file permissions or encoding)`,
-        );
-      } else {
-        throw err;
-      }
-    }
+    combinedPatch += runUnifiedDiff(oldPath, newPath, relativePath);
   }
 
   if (!combinedPatch.trim()) {

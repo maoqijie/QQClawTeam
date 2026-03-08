@@ -19,7 +19,12 @@ export interface AgentAssignment {
   status: 'assigned' | 'active' | 'completed' | 'failed';
 }
 
-export type TeamTaskStatus = 'pending' | 'planning' | 'in_progress' | 'completed' | 'failed';
+export type TeamTaskStatus =
+  | 'pending'
+  | 'planning'
+  | 'in_progress'
+  | 'completed'
+  | 'failed';
 
 export interface TeamTask {
   id: string;
@@ -52,13 +57,20 @@ export interface TeamTaskDb {
 export class TeamTaskManager {
   constructor(
     private readonly db: TeamTaskDb,
-    private readonly getAvailableAgents: (assignedAccounts: Set<string>) => string[],
+    private readonly getAvailableAgents: (
+      assignedAccounts: Set<string>,
+    ) => string[],
   ) {}
 
   /**
    * Create a new team task from a user request.
    */
-  createTask(userId: string, userChatJid: string, description: string, title?: string): TeamTask {
+  createTask(
+    userId: string,
+    userChatJid: string,
+    description: string,
+    title?: string,
+  ): TeamTask {
     const id = `tt-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const now = new Date().toISOString();
 
@@ -123,25 +135,25 @@ export class TeamTaskManager {
 
     const availableAgents = this.getAvailableAgents(assignedAccounts);
 
-    if (availableAgents.length === 0) {
-      logger.warn({
-        taskId,
-        needed: task.agentRoles.length,
-        available: 0,
-      }, 'No agents available');
+    if (availableAgents.length < task.agentRoles.length) {
+      logger.warn(
+        {
+          taskId,
+          needed: task.agentRoles.length,
+          available: availableAgents.length,
+        },
+        'Not enough agents available',
+      );
       return null;
     }
 
-    // Cycle through available agents when there are fewer accounts than roles.
-    // This allows a single agent account to play multiple roles in turn-based
-    // discussions, where messages are distinguished by role name prefix.
     const assignments: AgentAssignment[] = [];
     for (let i = 0; i < task.agentRoles.length; i++) {
       const role = task.agentRoles[i];
       const assignment: AgentAssignment = {
         id: `aa-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
         taskId,
-        qqAccount: availableAgents[i % availableAgents.length],
+        qqAccount: availableAgents[i],
         roleName: role.roleName,
         status: 'assigned',
       };
@@ -154,7 +166,10 @@ export class TeamTaskManager {
       updatedAt: new Date().toISOString(),
     });
 
-    logger.info({ taskId, assignments: assignments.length }, 'Agents assigned to task');
+    logger.info(
+      { taskId, assignments: assignments.length },
+      'Agents assigned to task',
+    );
     return assignments;
   }
 

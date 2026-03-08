@@ -106,3 +106,21 @@ export function initGitRepo(dir: string): void {
 export function cleanup(dir: string): void {
   fs.rmSync(dir, { recursive: true, force: true });
 }
+
+export function resolveLocalTsxCommand(): {
+  command: string;
+  prefixArgs: string[];
+} {
+  const localCli = path.resolve('node_modules/tsx/dist/cli.mjs');
+  if (fs.existsSync(localCli)) {
+    return {
+      command: process.execPath,
+      prefixArgs: [localCli],
+    };
+  }
+
+  return {
+    command: path.resolve('node_modules/.bin/tsx'),
+    prefixArgs: [],
+  };
+}

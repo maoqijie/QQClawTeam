@@ -85,7 +85,31 @@ interface ResponseApiLikeResult {
 interface NormalizedAssistantTurn {
   message: ChatCompletionAssistantMessageParam;
   text: string | null;
+  transport: 'chat' | 'responses';
 }
+
+interface ExecutedToolResult {
+  name: string;
+  arguments: Record<string, unknown> | null;
+  result: string;
+}
+
+interface ManualToolCall {
+  name: string;
+  arguments: Record<string, unknown>;
+}
+
+interface ManualToolCallsDirective {
+  type: 'tool_calls';
+  calls: ManualToolCall[];
+}
+
+interface ManualFinalDirective {
+  type: 'final';
+  message: string;
+}
+
+type ManualDirective = ManualToolCallsDirective | ManualFinalDirective;
 
 // --- Utility functions ---
 
@@ -150,6 +174,7 @@ function normalizeAssistantTurn(
     return {
       message,
       text: typeof message.content === 'string' ? message.content : null,
+      transport: 'chat',
     };
   }
 
@@ -203,6 +228,194 @@ function normalizeAssistantTurn(
       ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
     },
     text,
+    transport: 'responses',
+  };
+}
+
+function buildResponseRelayAssistantMessage(
+  toolCalls: ChatCompletionMessageToolCall[],
+  assistantText: string | null,
+): ChatCompletionAssistantMessageParam {
+  const summary = toolCalls.map((toolCall) => ({
+    name: toolCall.function.name,
+    arguments: toolCall.function.arguments,
+  }));
+
+  const parts = [
+    assistantText ? `已有回复片段：\n${assistantText}` : null,
+    `我请求执行以下工具调用：\n${JSON.stringify(summary, null, 2)}`,
+  ].filter(Boolean);
+
+  return {
+    role: 'assistant',
+    content: parts.join('\n\n'),
+  };
+}
+
+function buildResponseRelayUserMessage(
+  toolResults: ExecutedToolResult[],
+): ChatCompletionMessageParam {
+  return {
+    role: 'user',
+    content: [
+      '以下是你刚才请求的工具执行结果（JSON）：',
+      JSON.stringify(toolResults, null, 2),
+      '请继续完成任务。',
+      '如果还需要更多工具，请继续调用；如果已经足够，请直接给出最终答复。',
+    ].join('\n\n'),
+  };
+}
+
+function buildManualToolProtocol(tools: ChatCompletionTool[]): string {
+  const toolDescriptions = tools.map((tool) => {
+    const parameters = JSON.stringify(tool.function.parameters || {}, null, 2);
+    return [
+      `Tool: ${tool.function.name}`,
+      `Description: ${tool.function.description || '(none)'}`,
+      `Parameters JSON Schema:\n${parameters}`,
+    ].join('\n');
+  });
+
+  return [
+    'You must use a manual JSON tool protocol.',
+    'Always reply with JSON only. Do not wrap JSON in markdown fences. Do not add prose before or after the JSON.',
+    'When you need one or more tools, reply with exactly one JSON object in this shape:',
+    '{"type":"tool_calls","calls":[{"name":"tool_name","arguments":{}}]}',
+    'When you are completely finished, reply with exactly one JSON object in this shape:',
+    '{"type":"final","message":"your final answer"}',
+    'Never invent tools. Never omit required arguments. Never repeat an identical completed tool call unless you truly need to rerun it.',
+    'Available tools:',
+    toolDescriptions.join('\n\n'),
+  ].join('\n\n');
+}
+
+function stripCodeFences(text: string): string {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith('```')) {
+    return trimmed;
+  }
+
+  return trimmed
+    .replace(/^```[a-zA-Z0-9_-]*\s*/, '')
+    .replace(/\s*```$/, '')
+    .trim();
+}
+
+function extractJsonObjects(text: string): unknown[] {
+  const normalized = stripCodeFences(text);
+
+  try {
+    return [JSON.parse(normalized)];
+  } catch {
+    // Fall through to multi-object extraction.
+  }
+
+  const results: unknown[] = [];
+  let depth = 0;
+  let start = -1;
+  let inString = false;
+  let escaped = false;
+
+  for (let i = 0; i < normalized.length; i++) {
+    const ch = normalized[i];
+
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === '\\') {
+        escaped = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+
+    if (ch === '{') {
+      if (depth === 0) {
+        start = i;
+      }
+      depth++;
+      continue;
+    }
+
+    if (ch === '}') {
+      depth--;
+      if (depth === 0 && start >= 0) {
+        const candidate = normalized.slice(start, i + 1);
+        try {
+          results.push(JSON.parse(candidate));
+        } catch {
+          // Ignore malformed segments.
+        }
+        start = -1;
+      }
+    }
+  }
+
+  return results;
+}
+
+function isManualToolCall(value: unknown): value is ManualToolCall {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    typeof (value as { name?: unknown }).name === 'string' &&
+    typeof (value as { arguments?: unknown }).arguments === 'object' &&
+    (value as { arguments?: unknown }).arguments !== null &&
+    !Array.isArray((value as { arguments?: unknown }).arguments)
+  );
+}
+
+function parseManualDirectives(text: string): ManualDirective[] {
+  const directives: ManualDirective[] = [];
+
+  for (const candidate of extractJsonObjects(text)) {
+    if (
+      typeof candidate === 'object' &&
+      candidate !== null &&
+      (candidate as { type?: unknown }).type === 'tool_calls' &&
+      Array.isArray((candidate as { calls?: unknown }).calls)
+    ) {
+      const calls = (candidate as { calls: unknown[] }).calls.filter(isManualToolCall);
+      if (calls.length > 0) {
+        directives.push({ type: 'tool_calls', calls });
+      }
+      continue;
+    }
+
+    if (
+      typeof candidate === 'object' &&
+      candidate !== null &&
+      (candidate as { type?: unknown }).type === 'final' &&
+      typeof (candidate as { message?: unknown }).message === 'string'
+    ) {
+      directives.push({
+        type: 'final',
+        message: (candidate as { message: string }).message,
+      });
+    }
+  }
+
+  return directives;
+}
+
+function buildManualToolResultMessage(
+  toolResults: ExecutedToolResult[],
+): ChatCompletionMessageParam {
+  return {
+    role: 'user',
+    content: [
+      'The requested tool calls have been executed successfully.',
+      'Do not repeat any identical completed call unless rerun is necessary.',
+      'Tool results (JSON):',
+      JSON.stringify(toolResults, null, 2),
+      'Continue. Return JSON only.',
+    ].join('\n\n'),
   };
 }
 
@@ -853,7 +1066,10 @@ function executeTool(
 
 // --- System prompt builder ---
 
-function buildSystemPrompt(containerInput: ContainerInput): string {
+function buildSystemPrompt(
+  containerInput: ContainerInput,
+  tools: ChatCompletionTool[],
+): string {
   const parts: string[] = [];
 
   // Load group-level CLAUDE.md
@@ -876,6 +1092,7 @@ function buildSystemPrompt(containerInput: ContainerInput): string {
   );
   parts.push('Your working directory is /workspace/group.');
   parts.push(`Current time: ${new Date().toISOString()}`);
+  parts.push(buildManualToolProtocol(tools));
 
   return parts.join('\n\n');
 }
@@ -900,8 +1117,6 @@ async function runAgentLoop(
       response = await client.chat.completions.create({
         model,
         messages,
-        tools: tools.length > 0 ? tools : undefined,
-        tool_choice: tools.length > 0 ? 'auto' : undefined,
       });
     } catch (err: unknown) {
       const apiErr = err as {
@@ -939,44 +1154,61 @@ async function runAgentLoop(
       return null;
     }
 
-    const assistantMessage = normalizedTurn.message;
-    messages.push(assistantMessage);
-
-    // If no tool calls, we're done
-    if (
-      !assistantMessage.tool_calls ||
-      assistantMessage.tool_calls.length === 0
-    ) {
-      return normalizedTurn.text;
+    const assistantText = normalizedTurn.text?.trim();
+    if (!assistantText) {
+      messages.push({ role: 'assistant', content: '' });
+      messages.push({
+        role: 'user',
+        content:
+          'Your last response was empty. Return exactly one JSON object using the required protocol.',
+      });
+      continue;
     }
 
-    // Execute tool calls
-    for (const toolCall of assistantMessage.tool_calls) {
-      const fnName = toolCall.function.name;
-      let fnArgs: Record<string, unknown>;
+    messages.push({ role: 'assistant', content: assistantText });
 
-      try {
-        fnArgs = JSON.parse(toolCall.function.arguments || '{}');
-      } catch (parseErr) {
-        // Let the model know about the parse error so it can fix it
-        messages.push({
-          role: 'tool',
-          tool_call_id: toolCall.id,
-          content: `Error parsing arguments: ${parseErr instanceof Error ? parseErr.message : String(parseErr)}. Please provide valid JSON.`,
+    const directives = parseManualDirectives(assistantText);
+    const toolDirective = directives.find(
+      (directive): directive is ManualToolCallsDirective =>
+        directive.type === 'tool_calls',
+    );
+
+    if (toolDirective) {
+      const executedToolResults: ExecutedToolResult[] = [];
+
+      for (const call of toolDirective.calls) {
+        log(`Tool call: ${call.name}(${JSON.stringify(call.arguments).slice(0, 200)})`);
+        const result = executeTool(call.name, call.arguments, containerInput);
+        log(`Tool result: ${result.slice(0, 200)}`);
+        executedToolResults.push({
+          name: call.name,
+          arguments: call.arguments,
+          result,
         });
-        continue;
       }
 
-      log(`Tool call: ${fnName}(${JSON.stringify(fnArgs).slice(0, 200)})`);
-      const result = executeTool(fnName, fnArgs, containerInput);
-      log(`Tool result: ${result.slice(0, 200)}`);
+      messages.push(buildManualToolResultMessage(executedToolResults));
 
-      messages.push({
-        role: 'tool',
-        tool_call_id: toolCall.id,
-        content: result,
-      });
+      if (shouldClose()) {
+        log('Close sentinel detected during tool execution');
+        return null;
+      }
+      continue;
     }
+
+    const finalDirective = directives.find(
+      (directive): directive is ManualFinalDirective =>
+        directive.type === 'final',
+    );
+    if (finalDirective) {
+      return finalDirective.message;
+    }
+
+    messages.push({
+      role: 'user',
+      content:
+        'Your last response did not follow the required JSON protocol. Return exactly one JSON object and nothing else.',
+    });
 
     // Check for close sentinel between tool calls
     if (shouldClose()) {
@@ -1018,7 +1250,7 @@ export async function runOpenAIBackend(
   );
 
   const tools = buildToolDefinitions(containerInput.isMain);
-  const systemPrompt = buildSystemPrompt(containerInput);
+  const systemPrompt = buildSystemPrompt(containerInput, tools);
 
   // Conversation history (persists across IPC messages within this container session)
   const messages: ChatCompletionMessageParam[] = [

@@ -3,6 +3,10 @@ import path from 'path';
 
 import { readState, writeState } from './state.js';
 
+function toPortableRelativePath(relativePath: string): string {
+  return relativePath.split(path.sep).join('/');
+}
+
 function isWithinRoot(rootPath: string, targetPath: string): boolean {
   return targetPath === rootPath || targetPath.startsWith(rootPath + path.sep);
 }
@@ -65,7 +69,7 @@ function toSafeProjectRelativePath(
     );
   }
 
-  return path.relative(realRoot, realResolved);
+  return toPortableRelativePath(path.relative(realRoot, realResolved));
 }
 
 function sanitizeRemapEntries(
