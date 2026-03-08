@@ -3,6 +3,7 @@ import path from 'path';
 
 import {
   ASSISTANT_NAME,
+  DATA_DIR,
   IDLE_TIMEOUT,
   LLM_BACKEND,
   OPENAI_AUTO_COMPACT_TOKEN_LIMIT,
@@ -22,6 +23,7 @@ import {
   ContainerOutput,
   runContainerAgent,
   writeBotAccountsSnapshot,
+  writeChatHistorySnapshot,
   writeGroupsSnapshot,
   writeTasksSnapshot,
 } from './container-runner.js';
@@ -35,11 +37,14 @@ import {
   getAllSessions,
   getAllTasks,
   getMessagesSince,
+  getStoredMessagesForChat,
   getNewMessages,
   getRegisteredGroup,
   getRouterState,
   initDatabase,
   deleteSession,
+  deleteChatMetadata,
+  deleteMessagesForChat,
   setRegisteredGroup,
   setRouterState,
   setSession,
@@ -147,6 +152,31 @@ function clearChatContext(chatJid: string): void {
   saveState();
 
   logger.info({ chatJid, folder: group.folder }, 'Cleared chat context');
+}
+
+function wipeChatMemory(chatJid: string): void {
+  const group = registeredGroups[chatJid];
+  if (!group) {
+    throw new Error(`Chat ${chatJid} is not registered`);
+  }
+
+  clearChatContext(chatJid);
+  deleteMessagesForChat(chatJid);
+  deleteChatMetadata(chatJid);
+
+  const sessionDir = path.join(DATA_DIR, 'sessions', group.folder);
+  fs.rmSync(sessionDir, { recursive: true, force: true });
+
+  let groupDir: string;
+  try {
+    groupDir = resolveGroupFolderPath(group.folder);
+    fs.rmSync(path.join(groupDir, 'logs'), { recursive: true, force: true });
+    fs.mkdirSync(path.join(groupDir, 'logs'), { recursive: true });
+  } catch {
+    // ignore invalid/missing group folder during wipe
+  }
+
+  logger.info({ chatJid, folder: group.folder }, 'Wiped chat memory');
 }
 
 function registerGroup(jid: string, group: RegisteredGroup): void {
@@ -407,6 +437,15 @@ async function runAgent(
         }))
     : [];
   writeBotAccountsSnapshot(group.folder, isMain, botAccounts);
+
+  const storedHistory = getStoredMessagesForChat(chatJid, ASSISTANT_NAME, 200).map(
+    (message) => ({
+      senderName: message.sender_name,
+      content: message.content,
+      timestamp: message.timestamp,
+    }),
+  );
+  writeChatHistorySnapshot(group.folder, storedHistory);
 
   // Wrap onOutput to track session ID from streamed results
   const wrappedOnOutput = onOutput
@@ -970,6 +1009,7 @@ async function main(): Promise<void> {
     registerGroup,
     requestBotLoginTicket: ipcRequestBotLoginTicket,
     clearChatContext,
+    wipeChatMemory,
     updatePrivateLlmConfig: updatePrivateChatLlmConfig,
     syncGroups: async (force: boolean) => {
       await Promise.all(

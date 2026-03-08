@@ -743,6 +743,12 @@ export interface AvailableBotAccount {
   status: string;
 }
 
+export interface StoredChatHistoryMessage {
+  senderName: string;
+  content: string;
+  timestamp: string;
+}
+
 /**
  * Write available groups snapshot for the container to read.
  * Only main group can see all available groups (for activation).
@@ -789,6 +795,27 @@ export function writeBotAccountsSnapshot(
     JSON.stringify(
       {
         accounts: visibleAccounts,
+        lastSync: new Date().toISOString(),
+      },
+      null,
+      2,
+    ),
+  );
+}
+
+export function writeChatHistorySnapshot(
+  groupFolder: string,
+  messages: StoredChatHistoryMessage[],
+): void {
+  const groupIpcDir = resolveGroupIpcPath(groupFolder);
+  fs.mkdirSync(groupIpcDir, { recursive: true });
+
+  const historyFile = path.join(groupIpcDir, 'chat_history.json');
+  fs.writeFileSync(
+    historyFile,
+    JSON.stringify(
+      {
+        messages,
         lastSync: new Date().toISOString(),
       },
       null,

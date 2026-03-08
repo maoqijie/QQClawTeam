@@ -14,6 +14,11 @@ import { CronExpressionParser } from 'cron-parser';
 const IPC_DIR = '/workspace/ipc';
 const MESSAGES_DIR = path.join(IPC_DIR, 'messages');
 const TASKS_DIR = path.join(IPC_DIR, 'tasks');
+const PENDING_CONFIRMATIONS_FILE = path.join(
+  IPC_DIR,
+  'pending_confirmations.json',
+);
+const PENDING_CONFIRMATION_TTL_MS = 15 * 60 * 1000;
 
 // Context from environment variables (set by the agent runner)
 const chatJid = process.env.NANOCLAW_CHAT_JID!;
@@ -35,6 +40,67 @@ function writeIpcFile(dir: string, data: object): string {
   fs.renameSync(tempPath, filepath);
 
   return filename;
+}
+
+interface PendingConfirmationEntry {
+  token: string;
+  createdAt: string;
+  expiresAt: string;
+}
+
+type PendingConfirmationMap = Record<string, PendingConfirmationEntry>;
+
+function readPendingConfirmations(): PendingConfirmationMap {
+  if (!fs.existsSync(PENDING_CONFIRMATIONS_FILE)) return {};
+  try {
+    return JSON.parse(
+      fs.readFileSync(PENDING_CONFIRMATIONS_FILE, 'utf-8'),
+    ) as PendingConfirmationMap;
+  } catch {
+    return {};
+  }
+}
+
+function writePendingConfirmations(data: PendingConfirmationMap): void {
+  const tempPath = `${PENDING_CONFIRMATIONS_FILE}.tmp`;
+  fs.writeFileSync(tempPath, JSON.stringify(data, null, 2));
+  fs.renameSync(tempPath, PENDING_CONFIRMATIONS_FILE);
+}
+
+function getOrCreatePendingConfirmation(
+  action: 'clear_chat_context' | 'wipe_chat_memory',
+): PendingConfirmationEntry {
+  const now = Date.now();
+  const confirmations = readPendingConfirmations();
+  const existing = confirmations[action];
+  if (existing && Date.parse(existing.expiresAt) > now) {
+    return existing;
+  }
+
+  const createdAt = new Date(now).toISOString();
+  const entry: PendingConfirmationEntry = {
+    token: `${action}-${Math.random().toString(36).slice(2, 10)}`,
+    createdAt,
+    expiresAt: new Date(now + PENDING_CONFIRMATION_TTL_MS).toISOString(),
+  };
+  confirmations[action] = entry;
+  writePendingConfirmations(confirmations);
+  return entry;
+}
+
+function consumePendingConfirmation(
+  action: 'clear_chat_context' | 'wipe_chat_memory',
+  token: string | undefined,
+  confirmed?: boolean,
+): { ok: boolean; entry: PendingConfirmationEntry } {
+  const entry = getOrCreatePendingConfirmation(action);
+  if ((token && token === entry.token) || confirmed === true) {
+    const confirmations = readPendingConfirmations();
+    delete confirmations[action];
+    writePendingConfirmations(confirmations);
+    return { ok: true, entry };
+  }
+  return { ok: false, entry };
 }
 
 const server = new McpServer({
@@ -110,10 +176,67 @@ server.tool(
 );
 
 server.tool(
+  'recall_chat_history',
+  'Read stored NanoClaw chat history for the current chat from the local history snapshot. Useful after the active session context has been cleared but you still want to reconstruct earlier topics.',
+  {
+    limit: z.number().int().min(1).max(500).optional().describe('Maximum number of historical messages to return. Default 120.'),
+  },
+  async (args) => {
+    const historyFile = path.join(IPC_DIR, 'chat_history.json');
+    if (!fs.existsSync(historyFile)) {
+      return {
+        content: [{ type: 'text' as const, text: 'No stored NanoClaw chat history snapshot is available for this chat.' }],
+      };
+    }
+
+    const payload = JSON.parse(fs.readFileSync(historyFile, 'utf-8')) as {
+      messages?: Array<{ senderName: string; content: string; timestamp: string }>;
+      lastSync?: string;
+    };
+    const messages = payload.messages || [];
+    if (messages.length === 0) {
+      return {
+        content: [{ type: 'text' as const, text: 'NanoClaw has no stored message history for this chat.' }],
+      };
+    }
+
+    const selected = messages.slice(-(args.limit || 120));
+    const lines = selected.map((message) =>
+      `- [${message.timestamp}] ${message.senderName}: ${message.content}`,
+    );
+    if (payload.lastSync) {
+      lines.unshift(`History snapshot last sync: ${payload.lastSync}`);
+    }
+    lines.unshift(`Stored messages available: ${messages.length}`);
+
+    return {
+      content: [{ type: 'text' as const, text: lines.join('\n') }],
+    };
+  },
+);
+
+server.tool(
   'clear_chat_context',
   'Clear NanoClaw conversation context for the current chat. This resets the current session and message-processing cursor, but does not delete QQ client chat history or unregister the chat.',
-  {},
-  async () => {
+  {
+    confirm_token: z.string().optional().describe('Confirmation token returned by the previous clear_chat_context call. Required on the second step.'),
+    confirmed: z.boolean().optional().describe('Set to true after the user explicitly confirms the action. This can be used instead of repeating the token verbatim.'),
+  },
+  async (args) => {
+    const confirmation = consumePendingConfirmation(
+      'clear_chat_context',
+      args.confirm_token,
+      args.confirmed,
+    );
+    if (!confirmation.ok) {
+      return {
+        content: [{
+          type: 'text' as const,
+          text: `Confirmation required before clearing NanoClaw context for this chat. Ask the user to explicitly confirm, then call clear_chat_context again with confirm_token "${confirmation.entry.token}" before ${new Date(confirmation.entry.expiresAt).toLocaleString('zh-CN', { hour12: false })}. This does not delete QQ client chat history.`,
+        }],
+      };
+    }
+
     writeIpcFile(TASKS_DIR, {
       type: 'clear_chat_context',
       chatJid,
@@ -122,6 +245,40 @@ server.tool(
 
     return {
       content: [{ type: 'text' as const, text: 'Chat context clear requested. The next user message will start from a fresh NanoClaw session.' }],
+    };
+  },
+);
+
+server.tool(
+  'wipe_chat_memory',
+  'Aggressively wipe NanoClaw memory for the current chat. This clears the current session, processing cursor, stored database history for this chat, and session/log artifacts. It does not delete QQ client chat history or unregister the chat.',
+  {
+    confirm_token: z.string().optional().describe('Confirmation token returned by the previous wipe_chat_memory call. Required on the second step.'),
+    confirmed: z.boolean().optional().describe('Set to true after the user explicitly confirms the action. This can be used instead of repeating the token verbatim.'),
+  },
+  async (args) => {
+    const confirmation = consumePendingConfirmation(
+      'wipe_chat_memory',
+      args.confirm_token,
+      args.confirmed,
+    );
+    if (!confirmation.ok) {
+      return {
+        content: [{
+          type: 'text' as const,
+          text: `Confirmation required before aggressively wiping NanoClaw memory for this chat. Ask the user to explicitly confirm, then call wipe_chat_memory again with confirm_token "${confirmation.entry.token}" before ${new Date(confirmation.entry.expiresAt).toLocaleString('zh-CN', { hour12: false })}. This still does not delete QQ client chat history.`,
+        }],
+      };
+    }
+
+    writeIpcFile(TASKS_DIR, {
+      type: 'wipe_chat_memory',
+      chatJid,
+      timestamp: new Date().toISOString(),
+    });
+
+    return {
+      content: [{ type: 'text' as const, text: 'Aggressive chat memory wipe requested. NanoClaw will forget this chat history and start fresh on the next user message.' }],
     };
   },
 );

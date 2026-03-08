@@ -17,6 +17,7 @@ export interface IpcDeps {
   registerGroup: (jid: string, group: RegisteredGroup) => void;
   requestBotLoginTicket?: (chatJid: string) => Promise<void>;
   clearChatContext?: (chatJid: string) => Promise<void> | void;
+  wipeChatMemory?: (chatJid: string) => Promise<void> | void;
   updatePrivateLlmConfig?: (
     chatJid: string,
     containerConfig: RegisteredGroup['containerConfig'] | undefined,
@@ -202,6 +203,24 @@ export async function processTaskIpc(
           logger.warn(
             { chatJid: data.chatJid, sourceGroup },
             'Unauthorized clear_chat_context attempt blocked',
+          );
+        }
+      }
+      break;
+
+    case 'wipe_chat_memory':
+      if (data.chatJid && deps.wipeChatMemory) {
+        const targetGroup = registeredGroups[data.chatJid];
+        if (targetGroup && targetGroup.folder === sourceGroup) {
+          await deps.wipeChatMemory(data.chatJid);
+          logger.info(
+            { chatJid: data.chatJid, sourceGroup },
+            'Chat memory wiped via IPC',
+          );
+        } else {
+          logger.warn(
+            { chatJid: data.chatJid, sourceGroup },
+            'Unauthorized wipe_chat_memory attempt blocked',
           );
         }
       }

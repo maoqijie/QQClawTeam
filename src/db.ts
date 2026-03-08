@@ -396,6 +396,14 @@ export function storeMessageDirect(msg: {
   );
 }
 
+export function deleteMessagesForChat(chatJid: string): void {
+  db.prepare('DELETE FROM messages WHERE chat_jid = ?').run(chatJid);
+}
+
+export function deleteChatMetadata(chatJid: string): void {
+  db.prepare('DELETE FROM chats WHERE jid = ?').run(chatJid);
+}
+
 export function getNewMessages(
   jids: string[],
   lastTimestamp: string,
@@ -455,6 +463,27 @@ export function getMessagesSince(
   return db
     .prepare(sql)
     .all(chatJid, sinceTimestamp, `${botPrefix}:%`, limit) as NewMessage[];
+}
+
+export function getStoredMessagesForChat(
+  chatJid: string,
+  botPrefix: string,
+  limit: number = 200,
+): NewMessage[] {
+  const sql = `
+    SELECT * FROM (
+      SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me
+      FROM messages
+      WHERE chat_jid = ?
+        AND is_bot_message = 0 AND content NOT LIKE ?
+        AND content != '' AND content IS NOT NULL
+      ORDER BY timestamp DESC
+      LIMIT ?
+    ) ORDER BY timestamp
+  `;
+  return db
+    .prepare(sql)
+    .all(chatJid, `${botPrefix}:%`, limit) as NewMessage[];
 }
 
 export function createTask(

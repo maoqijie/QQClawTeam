@@ -517,7 +517,10 @@ async function runClaudeBackend(containerInput: ContainerInput): Promise<void> {
   let prompt = containerInput.prompt;
   prompt = `[Tooling note] When the user asks to add a bot account, refresh a QR code, or view/change/reset the current private chat model config, decide the intent yourself and use the available nanoclaw tools instead of asking for rigid command keywords.\n\n${prompt}`;
   prompt = `[Tooling note] When the user asks how many scheduling accounts are connected, or asks for the current bot account list, use the available nanoclaw tools to inspect the current connected accounts instead of guessing.\n\n${prompt}`;
+  prompt = `[Tooling note] When the user asks what was discussed before, asks to recall earlier topics, or wants a summary reconstructed from stored history after context was cleared, use the available nanoclaw tools to read the stored NanoClaw history snapshot instead of saying the old topics are unavailable.\n\n${prompt}`;
   prompt = `[Tooling note] When the user asks to clear, reset, or forget the current chat context, use the available nanoclaw tools to clear NanoClaw session context. Make it clear that this does not delete QQ client chat history.\n\n${prompt}`;
+  prompt = `[Tooling note] If the user explicitly asks for a more aggressive wipe that also removes NanoClaw stored chat history for this chat, use the available nanoclaw tools to wipe chat memory. Make it clear that QQ client chat history is still not deleted.\n\n${prompt}`;
+  prompt = `[Tooling note] Both the light context clear and the aggressive memory wipe require a two-step confirmation. First call the corresponding tool without confirmation, show the returned warning to the user, and only execute after the user explicitly confirms. When the user replies with clear confirmation phrases such as “确认清理”, “确认删除”, “继续”, or “确定”, call the same tool again with confirmed=true.\n\n${prompt}`;
   if (containerInput.isScheduledTask) {
     prompt = `[SCHEDULED TASK - The following message was sent automatically and is not coming directly from the user or group.]\n\n${prompt}`;
   }
