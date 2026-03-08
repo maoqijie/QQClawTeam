@@ -58,6 +58,8 @@ const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
 
 const MAX_TOOL_LOOPS = 50;
 const MAX_HISTORY_MESSAGES = 100;
+const DEFAULT_OPENAI_BASE_URL = 'https://new.fastaicode.top/v1';
+const DEFAULT_OPENAI_MODEL = 'gpt-5.4-pro';
 
 interface ResponseApiOutputTextItem {
   type: 'output_text';
@@ -1227,8 +1229,9 @@ export async function runOpenAIBackend(
   containerInput: ContainerInput,
 ): Promise<void> {
   const apiKey = containerInput.secrets?.OPENAI_API_KEY;
-  const baseURL = containerInput.secrets?.OPENAI_BASE_URL;
-  const model = containerInput.llmModel || 'gpt-4o';
+  const baseURL =
+    containerInput.secrets?.OPENAI_BASE_URL || DEFAULT_OPENAI_BASE_URL;
+  const model = containerInput.llmModel || DEFAULT_OPENAI_MODEL;
 
   if (!apiKey) {
     writeOutput({

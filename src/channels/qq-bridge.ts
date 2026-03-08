@@ -207,6 +207,91 @@ function trimCommandPrefix(text: string, prefix: string): string {
   return trimmed.slice(prefix.length).trimStart();
 }
 
+function detectModelToken(text: string): string | undefined {
+  const match = text.match(
+    /(?:^|[^A-Za-z0-9_])((?:gpt|o1|o3|o4|deepseek|qwen|glm|gemini|moonshot|yi|doubao|hunyuan|mistral|mixtral|llama|claude)[A-Za-z0-9._:-]*)(?=$|[^A-Za-z0-9_])/i,
+  );
+  return match?.[1]?.trim();
+}
+
+function detectBackendToken(text: string): 'claude' | 'openai' | undefined {
+  if (/\bclaude\b/i.test(text)) {
+    return 'claude';
+  }
+  if (/\b(?:openai|chatgpt)\b/i.test(text)) {
+    return 'openai';
+  }
+
+  const model = detectModelToken(text)?.toLowerCase();
+  if (!model) return undefined;
+  return model.startsWith('claude') ? 'claude' : 'openai';
+}
+
+function parseNaturalLanguageLlmCommand(
+  text: string,
+): PrivateBridgeCommand | null {
+  const trimmed = text.trim();
+  if (!trimmed) return null;
+
+  const hasQuestionIntent =
+    /(比较|对比|区别|是什么意思|是什么|为什么|怎么|如何|能不能|可不可以|行不行|支持不支持|推荐|哪个好|哪一个)/.test(
+      trimmed,
+    ) || /[？?]$/.test(trimmed);
+
+  const statusIntent =
+    /(你现在|当前|现在).*(模型|供应商|后端|llm)/.test(trimmed) ||
+    /(你现在|当前|现在).*(用|走).*(什么模型|哪个模型)/.test(trimmed) ||
+    /(现在是).*(openai|claude)/i.test(trimmed);
+  if (statusIntent) {
+    return { type: 'show-llm-status' };
+  }
+
+  const resetIntent =
+    /(恢复默认|重置|清除|取消).*(模型|供应商|后端|配置|llm|私聊|会话)/.test(
+      trimmed,
+    ) || /(按默认来|恢复成默认)/.test(trimmed);
+  if (resetIntent) {
+    return { type: 'reset-llm-config' };
+  }
+
+  const hasSwitchVerb =
+    /(切换|切到|切成|切回|改成|换成|换到|改用|改回|设为|设置为|设置成|调整到|改走|启用)/.test(
+      trimmed,
+    ) ||
+    /(以后|之后|接下来|从现在开始|后面|今后).*(用|走|切到|改用|换成)/.test(
+      trimmed,
+    );
+  const hasLlmScope =
+    /(模型|供应商|后端|llm|这个私聊|当前私聊|这个会话|当前会话)/.test(
+      trimmed,
+    ) || /(以后这个私聊|之后这个私聊|接下来这个私聊|从现在开始这个私聊)/.test(trimmed);
+
+  const backend = detectBackendToken(trimmed);
+  const model = detectModelToken(trimmed);
+
+  if (!hasSwitchVerb) {
+    return null;
+  }
+
+  if (hasQuestionIntent && !hasLlmScope) {
+    return null;
+  }
+
+  if (!hasLlmScope && !backend && !model) {
+    return null;
+  }
+
+  if (!backend && !model) {
+    return null;
+  }
+
+  return {
+    type: 'set-llm-config',
+    backend: backend || (model?.toLowerCase().startsWith('claude') ? 'claude' : 'openai'),
+    ...(model ? { model } : {}),
+  };
+}
+
 function parsePrivateBridgeCommand(text: string): PrivateBridgeCommand | null {
   const trimmed = text.trim();
   const normalized = trimmed.toLowerCase().replace(/\s+/g, '');
@@ -257,7 +342,7 @@ function parsePrivateBridgeCommand(text: string): PrivateBridgeCommand | null {
     };
   }
 
-  return null;
+  return parseNaturalLanguageLlmCommand(trimmed);
 }
 
 function getEffectiveLlmConfig(group: RegisteredGroup | undefined): {

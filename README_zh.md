@@ -38,12 +38,17 @@ claude
 
 NanoClaw 默认使用 Claude，但现在也支持接入 OpenAI 兼容 API。
 
+- 默认后端仍为 `Claude`
+- `Claude` 默认建议使用官方 OAuth 登录（`claude login` / `CLAUDE_CODE_OAUTH_TOKEN`）
+- 切到 `OpenAI-compatible` 后端时，如果未显式覆盖，默认网关为 `https://new.fastaicode.top/v1`
+- OpenAI-compatible 默认模型为 `gpt-5.4-pro`
+
 ```env
 LLM_BACKEND=openai
 OPENAI_API_KEY=sk-...
 # 填写提供商的完整 API 根路径；大多数兼容网关都需要以 /v1 结尾。
-OPENAI_BASE_URL=https://api.openai.com/v1
-OPENAI_MODEL=gpt-4o
+OPENAI_BASE_URL=https://new.fastaicode.top/v1
+OPENAI_MODEL=gpt-5.4-pro
 ```
 
 如果您使用 OpenAI 兼容提供商，请确认它完整支持工具 / 函数调用。NanoClaw 的 Shell、文件编辑、计划任务与管理能力都依赖工具调用链路。
@@ -55,6 +60,14 @@ OPENAI_MODEL=gpt-4o
 切换模型 openai gpt-5.4-pro
 切换供应商 claude
 恢复默认模型
+```
+
+也支持更自然的说法，例如：
+
+```text
+以后这个私聊改用 openai 的 gpt-5.4-pro 来回复我
+从现在开始这个会话切回 claude 吧
+你现在这个私聊用的是什么模型
 ```
 
 这些命令只会影响当前私聊会话，不会改动其他群聊或私聊的模型配置。

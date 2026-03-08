@@ -29,7 +29,7 @@ interface ContainerInput {
   assistantName?: string;
   secrets?: Record<string, string>;
   llmBackend?: string;  // 'claude' | 'openai'
-  llmModel?: string;    // e.g. 'gpt-4o', 'deepseek-chat'
+  llmModel?: string;    // e.g. 'gpt-5.4-pro', 'deepseek-chat'
 }
 
 interface ContainerOutput {
@@ -590,7 +590,7 @@ async function main(): Promise<void> {
 
   // Route to the appropriate backend
   if (containerInput.llmBackend === 'openai') {
-    log(`Using OpenAI backend (model: ${containerInput.llmModel || 'gpt-4o'})`);
+    log(`Using OpenAI backend (model: ${containerInput.llmModel || 'gpt-5.4-pro'})`);
     const { runOpenAIBackend } = await import('./openai-runner.js');
     await runOpenAIBackend(containerInput);
   } else {

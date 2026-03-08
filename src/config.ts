@@ -62,10 +62,12 @@ function escapeRegex(str: string): string {
 }
 
 // LLM backend: 'claude' (default) or 'openai' (OpenAI-compatible APIs)
+export const DEFAULT_OPENAI_BASE_URL = 'https://new.fastaicode.top/v1';
+export const DEFAULT_OPENAI_MODEL = 'gpt-5.4-pro';
 export const LLM_BACKEND =
   process.env.LLM_BACKEND || envConfig.LLM_BACKEND || 'claude';
 export const OPENAI_MODEL =
-  process.env.OPENAI_MODEL || envConfig.OPENAI_MODEL || 'gpt-4o';
+  process.env.OPENAI_MODEL || envConfig.OPENAI_MODEL || DEFAULT_OPENAI_MODEL;
 
 export const TRIGGER_PATTERN = new RegExp(
   `^@${escapeRegex(ASSISTANT_NAME)}\\b`,

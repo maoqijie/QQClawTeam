@@ -38,12 +38,17 @@ Then run `/setup`. Claude Code handles everything: dependencies, authentication,
 
 NanoClaw defaults to Claude, but it can also run against OpenAI-compatible APIs.
 
+- The default backend remains `Claude`
+- `Claude` is expected to use the official OAuth login by default (`claude login` / `CLAUDE_CODE_OAUTH_TOKEN`)
+- When you switch to the OpenAI-compatible backend and do not override the gateway, the built-in default is `https://new.fastaicode.top/v1`
+- The default OpenAI-compatible model is `gpt-5.4-pro`
+
 ```env
 LLM_BACKEND=openai
 OPENAI_API_KEY=sk-...
 # Use the provider's full API root. Most compatible gateways expect /v1.
-OPENAI_BASE_URL=https://api.openai.com/v1
-OPENAI_MODEL=gpt-4o
+OPENAI_BASE_URL=https://new.fastaicode.top/v1
+OPENAI_MODEL=gpt-5.4-pro
 ```
 
 If you use an OpenAI-compatible provider, make sure it supports tool/function calling end-to-end. NanoClaw relies on tool calls for shell access, file edits, scheduled tasks, and admin actions.
@@ -55,6 +60,14 @@ show model
 switch model openai gpt-5.4-pro
 switch provider claude
 reset model
+```
+
+Natural-language phrasing also works, for example:
+
+```text
+Use OpenAI with gpt-5.4-pro for this DM from now on
+Switch this conversation back to Claude
+What model is this DM currently using?
 ```
 
 These commands only affect the current private chat session, not every group or DM.

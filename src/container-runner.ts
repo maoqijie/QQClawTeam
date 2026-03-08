@@ -11,6 +11,7 @@ import {
   CONTAINER_MAX_OUTPUT_SIZE,
   CONTAINER_TIMEOUT,
   DATA_DIR,
+  DEFAULT_OPENAI_BASE_URL,
   GROUPS_DIR,
   IDLE_TIMEOUT,
   TIMEZONE,
@@ -250,7 +251,7 @@ function buildVolumeMountsWithTeam(
  * Secrets are never written to disk or mounted as files.
  */
 function readSecrets(): Record<string, string> {
-  return readEnvFile([
+  const secrets = readEnvFile([
     'CLAUDE_CODE_OAUTH_TOKEN',
     'ANTHROPIC_API_KEY',
     'ANTHROPIC_BASE_URL',
@@ -258,6 +259,12 @@ function readSecrets(): Record<string, string> {
     'OPENAI_API_KEY',
     'OPENAI_BASE_URL',
   ]);
+
+  if (!secrets.OPENAI_BASE_URL) {
+    secrets.OPENAI_BASE_URL = DEFAULT_OPENAI_BASE_URL;
+  }
+
+  return secrets;
 }
 
 function buildContainerArgs(

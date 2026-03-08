@@ -468,6 +468,133 @@ describe('QQBridgeChannel', () => {
     await channel.disconnect();
   });
 
+  it('handles natural language llm switch requests in private chat', async () => {
+    const { opts, messages, llmUpdates } = createOpts();
+    const channel = new QQBridgeChannel(createConfig(), opts, fetch);
+
+    const privateTexts: Array<{ userId: string; text: string }> = [];
+    channel.setFleetManager({
+      getMainConnector: () => ({
+        sendPrivateMsg: async (userId: string, text: string) => {
+          privateTexts.push({ userId, text });
+          return { retcode: 0, status: 'ok' };
+        },
+      }),
+    } as any);
+
+    await channel.connect();
+    const port = channel.getPort();
+
+    await fetch(`http://127.0.0.1:${port}/qq-bridge/inbound`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-qq-bridge-secret': 'test-secret',
+      },
+      body: JSON.stringify({
+        chat: { id: '1000', type: 'private', name: 'Alice' },
+        sender: { id: '2000', name: 'Alice' },
+        message: { text: '以后这个私聊改用 openai 的 gpt-5.4-pro 来回复我' },
+      }),
+    });
+
+    expect(messages).toHaveLength(0);
+    expect(privateTexts).toHaveLength(1);
+    expect(privateTexts[0]?.text).toContain('已切换当前私聊会话的模型配置');
+    expect(getRegisteredGroup('qq:private:1000')?.containerConfig).toEqual({
+      llmBackend: 'openai',
+      llmModel: 'gpt-5.4-pro',
+    });
+    expect(llmUpdates.at(-1)).toEqual({
+      chatJid: 'qq:private:1000',
+      containerConfig: {
+        llmBackend: 'openai',
+        llmModel: 'gpt-5.4-pro',
+      },
+    });
+
+    await channel.disconnect();
+  });
+
+  it('handles natural language provider fallback to claude in private chat', async () => {
+    const { opts, messages, llmUpdates } = createOpts();
+    const channel = new QQBridgeChannel(createConfig(), opts, fetch);
+
+    const privateTexts: Array<{ userId: string; text: string }> = [];
+    channel.setFleetManager({
+      getMainConnector: () => ({
+        sendPrivateMsg: async (userId: string, text: string) => {
+          privateTexts.push({ userId, text });
+          return { retcode: 0, status: 'ok' };
+        },
+      }),
+    } as any);
+
+    await channel.connect();
+    const port = channel.getPort();
+
+    await fetch(`http://127.0.0.1:${port}/qq-bridge/inbound`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-qq-bridge-secret': 'test-secret',
+      },
+      body: JSON.stringify({
+        chat: { id: '1000', type: 'private', name: 'Alice' },
+        sender: { id: '2000', name: 'Alice' },
+        message: { text: '从现在开始这个会话切回 claude 吧' },
+      }),
+    });
+
+    expect(messages).toHaveLength(0);
+    expect(privateTexts).toHaveLength(1);
+    expect(privateTexts[0]?.text).toContain('claude');
+    expect(getRegisteredGroup('qq:private:1000')?.containerConfig).toEqual({
+      llmBackend: 'claude',
+    });
+    expect(llmUpdates.at(-1)).toEqual({
+      chatJid: 'qq:private:1000',
+      containerConfig: {
+        llmBackend: 'claude',
+      },
+    });
+
+    await channel.disconnect();
+  });
+
+  it('does not hijack normal comparison questions as llm switch commands', async () => {
+    const { opts, messages, llmUpdates } = createOpts();
+    const channel = new QQBridgeChannel(createConfig(), opts, fetch);
+
+    await channel.connect();
+    const port = channel.getPort();
+
+    const response = await fetch(`http://127.0.0.1:${port}/qq-bridge/inbound`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-qq-bridge-secret': 'test-secret',
+      },
+      body: JSON.stringify({
+        chat: { id: '1000', type: 'private', name: 'Alice' },
+        sender: { id: '2000', name: 'Alice' },
+        message: { text: '帮我比较一下 openai 和 claude 哪个更适合写代码' },
+      }),
+    });
+
+    const body = (await response.json()) as {
+      accepted: boolean;
+      registered: boolean;
+    };
+    expect(response.status).toBe(200);
+    expect(body.accepted).toBe(true);
+    expect(body.registered).toBe(true);
+    expect(messages).toHaveLength(1);
+    expect(llmUpdates).toHaveLength(0);
+
+    await channel.disconnect();
+  });
+
   it('handles private add-bot-account command and returns qr ticket', async () => {
     const { opts, messages } = createOpts();
     const channel = new QQBridgeChannel(
