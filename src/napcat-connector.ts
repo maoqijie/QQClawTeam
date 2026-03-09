@@ -32,6 +32,13 @@ export interface OneBotGroupMember {
   role: 'owner' | 'admin' | 'member';
 }
 
+export interface OneBotStrangerInfo {
+  user_id: number;
+  nickname: string;
+  sex?: string;
+  age?: number;
+}
+
 export class NapCatConnector {
   private readonly baseUrl: string;
 
@@ -125,6 +132,14 @@ export class NapCatConnector {
   async getLoginInfo(): Promise<{ user_id: number; nickname: string }> {
     const resp = await this.callApi('get_login_info');
     return resp.data as { user_id: number; nickname: string };
+  }
+
+  async getStrangerInfo(userId: string): Promise<OneBotStrangerInfo | null> {
+    const resp = await this.callApi('get_stranger_info', {
+      user_id: Number(userId),
+      no_cache: false,
+    });
+    return (resp.data as OneBotStrangerInfo) || null;
   }
 
   async setGroupCard(groupId: string, userId: string, card: string): Promise<OneBotResponse> {

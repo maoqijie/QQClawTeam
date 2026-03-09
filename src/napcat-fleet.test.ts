@@ -175,7 +175,7 @@ describe('NapCatFleetManager login lifecycle', () => {
     ]);
   });
 
-  it('已存在账号会被视为失败并立即清理', async () => {
+  it('已在线的账号会被视为失败并立即清理', async () => {
     const manager = createManager();
     const events: NapCatLoginLifecycleEvent[] = [];
     const instance = createPendingInstance({
@@ -191,6 +191,7 @@ describe('NapCatFleetManager login lifecycle', () => {
       ...createPendingInstance({ qqAccount: '20001', storageKey: '20001' }),
       qqAccount: '20001',
       storageKey: '20001',
+      status: 'running',
       pendingLogin: undefined,
     });
 
@@ -206,6 +207,43 @@ describe('NapCatFleetManager login lifecycle', () => {
     expect((manager as any).instances.has('pending-ticket-1')).toBe(false);
     expect(fs.existsSync(instance.dataDir)).toBe(false);
     expect(fs.existsSync(dynamicAccountsPath)).toBe(false);
+  });
+
+  it('离线的已接入账号允许重新登录恢复，不视为重复接入', async () => {
+    const manager = createManager();
+    const events: NapCatLoginLifecycleEvent[] = [];
+    const instance = createPendingInstance({
+      loginInfo: { user_id: 20001, nickname: '恢复账号' },
+      onEvent: async (event) => {
+        events.push(event);
+      },
+    });
+
+    (manager as any).instances.set('pending-ticket-1', instance);
+    (manager as any).instances.set('20001', {
+      ...createPendingInstance({ qqAccount: '20001', storageKey: '20001' }),
+      qqAccount: '20001',
+      storageKey: '20001',
+      status: 'error',
+      pendingLogin: undefined,
+    });
+
+    await (manager as any).promotePendingLogin('pending-ticket-1', instance);
+
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        state: 'success',
+        qqAccount: '20001',
+        nickname: '恢复账号',
+      }),
+    );
+    expect(events).not.toContainEqual(
+      expect.objectContaining({
+        state: 'failed',
+        reason: '该账号已接入',
+      }),
+    );
+    expect((manager as any).instances.has('20001')).toBe(true);
   });
 
   it('过期轮询会通知 expired 并回收目录', async () => {
@@ -272,5 +310,77 @@ describe('NapCatFleetManager login lifecycle', () => {
         state: 'qr_ready',
       }),
     );
+  });
+
+  it('在账号掉线和恢复时发出健康状态事件', async () => {
+    const manager = createManager();
+    const events: Array<{ qqAccount: string; status: string; role: string }> = [];
+    manager.setHealthEventHandler(async (event) => {
+      events.push({
+        qqAccount: event.qqAccount,
+        status: event.status,
+        role: event.role,
+      });
+    });
+
+    let alive = false;
+    (manager as any).instances.set('20001', {
+      qqAccount: '20001',
+      role: 'agent',
+      storageKey: '20001',
+      dataDir: '',
+      containerName: 'napcat-20001',
+      httpPort: 3002,
+      wsPort: 4002,
+      reportUrl: 'http://127.0.0.1:8787/qq-bridge/inbound',
+      connector: {
+        async isAlive() {
+          return alive;
+        },
+      },
+      status: 'running',
+    });
+
+    await (manager as any).healthCheck();
+    alive = true;
+    await (manager as any).healthCheck();
+
+    expect(events).toEqual([
+      { qqAccount: '20001', status: 'error', role: 'agent' },
+      { qqAccount: '20001', status: 'running', role: 'agent' },
+    ]);
+  });
+
+  it('同一次掉线期间不会重复发送离线提醒', async () => {
+    const manager = createManager();
+    const events: Array<{ qqAccount: string; status: string }> = [];
+    manager.setHealthEventHandler(async (event) => {
+      events.push({ qqAccount: event.qqAccount, status: event.status });
+    });
+
+    let alive = false;
+    (manager as any).instances.set('20001', {
+      qqAccount: '20001',
+      role: 'agent',
+      storageKey: '20001',
+      dataDir: '',
+      containerName: 'napcat-20001',
+      httpPort: 3002,
+      wsPort: 4002,
+      reportUrl: 'http://127.0.0.1:8787/qq-bridge/inbound',
+      connector: {
+        async isAlive() {
+          return alive;
+        },
+      },
+      status: 'running',
+    });
+
+    await (manager as any).healthCheck();
+    await (manager as any).healthCheck();
+
+    expect(events).toEqual([
+      { qqAccount: '20001', status: 'error' },
+    ]);
   });
 });

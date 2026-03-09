@@ -161,6 +161,22 @@ export class GroupQueue {
     state.process = proc;
     state.containerName = containerName;
     if (groupFolder) state.groupFolder = groupFolder;
+    proc.once('exit', () => {
+      const current = this.getGroup(groupJid);
+      if (current.process !== proc) return;
+      const wasActive = current.active;
+      current.active = false;
+      current.idleWaiting = false;
+      current.isTaskContainer = false;
+      current.runningTaskId = null;
+      current.process = null;
+      current.containerName = null;
+      current.groupFolder = null;
+      if (wasActive && this.activeCount > 0) {
+        this.activeCount--;
+      }
+      this.drainGroup(groupJid);
+    });
   }
 
   /**
@@ -215,6 +231,23 @@ export class GroupQueue {
     }
   }
 
+  terminateGroupProcess(groupJid: string): void {
+    const state = this.getGroup(groupJid);
+    if (state.process && !state.process.killed) {
+      try {
+        state.process.kill('SIGKILL');
+      } catch {
+        // ignore
+      }
+    }
+    state.active = false;
+    state.idleWaiting = false;
+    state.process = null;
+    state.containerName = null;
+    state.groupFolder = null;
+    state.pendingMessages = false;
+  }
+
   private async runForGroup(
     groupJid: string,
     reason: 'messages' | 'drain',
@@ -244,12 +277,17 @@ export class GroupQueue {
       logger.error({ groupJid, err }, 'Error processing messages for group');
       this.scheduleRetry(groupJid, state);
     } finally {
-      state.active = false;
-      state.process = null;
-      state.containerName = null;
-      state.groupFolder = null;
-      this.activeCount--;
-      this.drainGroup(groupJid);
+      const processStillRunning = Boolean(state.process && !state.process.killed);
+      if (!processStillRunning) {
+        state.active = false;
+        state.process = null;
+        state.containerName = null;
+        state.groupFolder = null;
+        if (this.activeCount > 0) {
+          this.activeCount--;
+        }
+        this.drainGroup(groupJid);
+      }
     }
   }
 
@@ -271,14 +309,19 @@ export class GroupQueue {
     } catch (err) {
       logger.error({ groupJid, taskId: task.id, err }, 'Error running task');
     } finally {
-      state.active = false;
-      state.isTaskContainer = false;
-      state.runningTaskId = null;
-      state.process = null;
-      state.containerName = null;
-      state.groupFolder = null;
-      this.activeCount--;
-      this.drainGroup(groupJid);
+      const processStillRunning = Boolean(state.process && !state.process.killed);
+      if (!processStillRunning) {
+        state.active = false;
+        state.isTaskContainer = false;
+        state.runningTaskId = null;
+        state.process = null;
+        state.containerName = null;
+        state.groupFolder = null;
+        if (this.activeCount > 0) {
+          this.activeCount--;
+        }
+        this.drainGroup(groupJid);
+      }
     }
   }
 

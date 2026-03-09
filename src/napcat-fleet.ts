@@ -59,6 +59,7 @@ export interface NapCatAccountConfig {
   qqAccount: string;
   role: AccountRole;
   storageKey?: string;
+  nickname?: string;
 }
 
 export interface NapCatInstance {
@@ -74,8 +75,19 @@ export interface NapCatInstance {
   reportUrl: string;
   connector: NapCatConnector;
   status: 'starting' | 'running' | 'stopped' | 'error';
+  lastNotifiedHealthStatus?: 'running' | 'error';
+  nickname?: string;
   lastHealthCheck?: string;
   pendingLogin?: PendingLoginSession;
+}
+
+export interface NapCatHealthEvent {
+  qqAccount: string;
+  nickname?: string;
+  role: AccountRole;
+  status: 'running' | 'error';
+  occurredAt: string;
+  reason?: string;
 }
 
 export interface NapCatLoginTicket {
@@ -162,6 +174,10 @@ function readDynamicAccounts(): NapCatAccountConfig[] {
           typeof item?.storageKey === 'string' && item.storageKey.trim()
             ? item.storageKey.trim()
             : undefined,
+        nickname:
+          typeof item?.nickname === 'string' && item.nickname.trim()
+            ? item.nickname.trim()
+            : undefined,
       }))
       .filter((item) => item.qqAccount);
   } catch (err) {
@@ -177,6 +193,24 @@ function writeDynamicAccounts(accounts: NapCatAccountConfig[]): void {
     JSON.stringify(accounts, null, 2),
     'utf-8',
   );
+}
+
+function persistAccountNickname(
+  qqAccount: string,
+  nickname: string | undefined,
+): void {
+  if (!nickname) return;
+  const accounts = readDynamicAccounts();
+  let changed = false;
+  for (const account of accounts) {
+    if (account.qqAccount === qqAccount && account.nickname !== nickname) {
+      account.nickname = nickname;
+      changed = true;
+    }
+  }
+  if (changed) {
+    writeDynamicAccounts(accounts);
+  }
 }
 
 function mergeAccounts(
@@ -235,12 +269,49 @@ export class NapCatFleetManager {
   private healthCheckInterval: ReturnType<typeof setInterval> | null = null;
   private pendingLoginInterval: ReturnType<typeof setInterval> | null = null;
   private readonly config: NapCatFleetConfig;
+  private onHealthEvent?: (event: NapCatHealthEvent) => Promise<void> | void;
 
   constructor(config: NapCatFleetConfig) {
     this.config = {
       ...config,
       accounts: mergeAccounts(config.accounts, readDynamicAccounts()),
     };
+  }
+
+  setHealthEventHandler(
+    handler: (event: NapCatHealthEvent) => Promise<void> | void,
+  ): void {
+    this.onHealthEvent = handler;
+  }
+
+  private async emitHealthEvent(
+    event: NapCatHealthEvent,
+  ): Promise<void> {
+    if (!this.onHealthEvent) return;
+    try {
+      await this.onHealthEvent(event);
+    } catch (err) {
+      logger.warn({ err, event }, 'Failed to dispatch NapCat health event');
+    }
+  }
+
+  private async resolveNicknameViaMain(
+    qqAccount: string,
+    existingNickname?: string,
+  ): Promise<string | undefined> {
+    if (existingNickname) return existingNickname;
+
+    const mainConnector = this.getMainConnector();
+    if (!mainConnector || mainConnector.qqAccount === qqAccount) {
+      return existingNickname;
+    }
+
+    try {
+      const info = await mainConnector.getStrangerInfo(qqAccount);
+      return info?.nickname || existingNickname;
+    } catch {
+      return existingNickname;
+    }
   }
 
   /**
@@ -303,6 +374,7 @@ export class NapCatFleetManager {
       reportUrl: '',
       connector,
       status: 'starting',
+      nickname: account.nickname,
     };
 
     this.instances.set(account.qqAccount, instance);
@@ -313,6 +385,7 @@ export class NapCatFleetManager {
       if (alive) {
         instance.status = 'running';
         const info = await connector.getLoginInfo();
+        instance.nickname = info?.nickname || undefined;
         logger.info(
           { qqAccount: account.qqAccount, httpPort, nickname: info?.nickname },
           'Connected to external NapCat instance',
@@ -438,6 +511,7 @@ export class NapCatFleetManager {
       reportUrl,
       connector,
       status: 'starting',
+      nickname: account.nickname,
       pendingLogin: options?.pendingLogin,
     };
 
@@ -462,11 +536,47 @@ export class NapCatFleetManager {
         instance.lastHealthCheck = new Date().toISOString();
 
         if (alive && prevStatus !== 'running') {
+          let nickname = instance.nickname;
+          try {
+            const info = await instance.connector.getLoginInfo();
+            nickname = info?.nickname || nickname;
+            instance.nickname = nickname;
+            persistAccountNickname(qqAccount, nickname);
+          } catch {
+            // Ignore nickname lookup errors during recovery notification.
+          }
           logger.info({ qqAccount }, 'NapCat instance is now running');
+          if (instance.lastNotifiedHealthStatus !== 'running') {
+            await this.emitHealthEvent({
+              qqAccount,
+              nickname,
+              role: instance.role,
+              status: 'running',
+              occurredAt: new Date().toISOString(),
+            });
+            instance.lastNotifiedHealthStatus = 'running';
+          }
         }
 
-        if (!alive && prevStatus === 'running') {
+        if (!alive && prevStatus !== 'error') {
           logger.warn({ qqAccount }, 'NapCat instance became unhealthy');
+          const nickname = await this.resolveNicknameViaMain(
+            qqAccount,
+            instance.nickname,
+          );
+          instance.nickname = nickname;
+          persistAccountNickname(qqAccount, nickname);
+          if (instance.lastNotifiedHealthStatus !== 'error') {
+            await this.emitHealthEvent({
+              qqAccount,
+              nickname,
+              role: instance.role,
+              status: 'error',
+              occurredAt: new Date().toISOString(),
+              reason: '账号离线或 OneBot 接口不可用',
+            });
+            instance.lastNotifiedHealthStatus = 'error';
+          }
           if (this.config.mode === 'docker') {
             try {
               await execAsync(`docker restart ${instance.containerName}`);
@@ -477,8 +587,26 @@ export class NapCatFleetManager {
           }
         }
       } catch (err) {
+        const prevStatus = instance.status;
         instance.status = 'error';
         logger.warn({ qqAccount, err }, 'Health check failed');
+        if (prevStatus !== 'error' && instance.lastNotifiedHealthStatus !== 'error') {
+          const nickname = await this.resolveNicknameViaMain(
+            qqAccount,
+            instance.nickname,
+          );
+          instance.nickname = nickname;
+          persistAccountNickname(qqAccount, nickname);
+          await this.emitHealthEvent({
+            qqAccount,
+            nickname,
+            role: instance.role,
+            status: 'error',
+            occurredAt: new Date().toISOString(),
+            reason: err instanceof Error ? err.message : '健康检查失败',
+          });
+          instance.lastNotifiedHealthStatus = 'error';
+        }
       }
     }
   }
@@ -959,17 +1087,47 @@ export class NapCatFleetManager {
 
     const existing = this.instances.get(realAccount);
     if (existing && existing !== instance) {
-      logger.warn(
-        { realAccount, placeholderAccount },
-        'Pending NapCat login resolved to an already connected account',
+      if (existing.status === 'running') {
+        logger.warn(
+          { realAccount, placeholderAccount },
+          'Pending NapCat login resolved to an already connected account',
+        );
+        await this.emitPendingLoginEvent(instance, 'failed', {
+          qqAccount: realAccount,
+          nickname: info.nickname || undefined,
+          reason: '该账号已接入',
+        });
+        await this.cleanupPendingLogin(placeholderAccount, instance);
+        return;
+      }
+
+      logger.info(
+        {
+          realAccount,
+          placeholderAccount,
+          existingStatus: existing.status,
+        },
+        'Pending NapCat login resolved to an offline account, replacing stale instance',
       );
-      await this.emitPendingLoginEvent(instance, 'failed', {
-        qqAccount: realAccount,
-        nickname: info.nickname || undefined,
-        reason: '该账号已接入',
-      });
-      await this.cleanupPendingLogin(placeholderAccount, instance);
-      return;
+
+      if (this.config.mode === 'docker' && existing.containerName) {
+        try {
+          await execAsync(`docker stop ${existing.containerName}`);
+        } catch {
+          // Ignore stale container stop errors.
+        }
+        try {
+          await execAsync(`docker rm ${existing.containerName}`);
+        } catch {
+          // Ignore stale container remove errors.
+        }
+      }
+
+      if (existing.dataDir) {
+        fs.rmSync(existing.dataDir, { recursive: true, force: true });
+      }
+
+      this.instances.delete(realAccount);
     }
 
     const persisted = readDynamicAccounts();
@@ -978,6 +1136,7 @@ export class NapCatFleetManager {
       qqAccount: realAccount,
       role: instance.role,
       storageKey: instance.storageKey,
+      nickname: info.nickname || undefined,
     };
     merged.push(nextAccount);
     writeDynamicAccounts(merged);
@@ -991,11 +1150,39 @@ export class NapCatFleetManager {
       nickname: info.nickname || undefined,
     });
 
+    let nextContainerName = instance.containerName;
+    if (this.config.mode === 'docker') {
+      const desiredContainerName = `napcat-${instance.storageKey}`;
+      if (instance.containerName !== desiredContainerName) {
+        try {
+          await execAsync(`docker rm -f ${desiredContainerName}`);
+        } catch {
+          // Ignore if the target container does not exist yet.
+        }
+        try {
+          await execAsync(`docker rename ${instance.containerName} ${desiredContainerName}`);
+          nextContainerName = desiredContainerName;
+        } catch (err) {
+          logger.warn(
+            {
+              err,
+              from: instance.containerName,
+              to: desiredContainerName,
+              realAccount,
+            },
+            'Failed to promote pending NapCat container name',
+          );
+        }
+      }
+    }
+
     this.instances.delete(placeholderAccount);
     this.instances.set(realAccount, {
       ...instance,
       qqAccount: realAccount,
+      containerName: nextContainerName,
       connector: new NapCatConnector(realAccount, instance.httpPort),
+      nickname: info.nickname || undefined,
       pendingLogin: undefined,
       status: 'running',
     });

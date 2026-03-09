@@ -83,11 +83,15 @@ import {
 import { startSchedulerLoop } from './task-scheduler.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
-import { NapCatFleetManager, loadFleetConfig } from './napcat-fleet.js';
+import {
+  NapCatFleetManager,
+  type NapCatHealthEvent,
+  loadFleetConfig,
+} from './napcat-fleet.js';
 import { GroupPoolManager } from './group-pool.js';
 import { TeamTaskManager } from './team-task.js';
 import { DiscussionEngine } from './discussion-engine.js';
-import { QQBridgeChannel } from './channels/qq-bridge.js';
+import { buildDefaultClaudeMdContent, QQBridgeChannel } from './channels/qq-bridge.js';
 
 // Re-export for backwards compatibility during refactor
 export { escapeXml, formatMessages } from './router.js';
@@ -167,6 +171,9 @@ function wipeChatMemory(chatJid: string): void {
   const sessionDir = path.join(DATA_DIR, 'sessions', group.folder);
   fs.rmSync(sessionDir, { recursive: true, force: true });
 
+  const groupIpcDir = resolveGroupIpcPath(group.folder);
+  fs.rmSync(path.join(groupIpcDir, 'chat_history.json'), { force: true });
+
   let groupDir: string;
   try {
     groupDir = resolveGroupFolderPath(group.folder);
@@ -177,6 +184,88 @@ function wipeChatMemory(chatJid: string): void {
   }
 
   logger.info({ chatJid, folder: group.folder }, 'Wiped chat memory');
+}
+
+function getMainControlChatJid(): string | undefined {
+  for (const [jid, group] of Object.entries(registeredGroups)) {
+    if (group.isMain === true) {
+      return jid;
+    }
+  }
+  return undefined;
+}
+
+function formatNapCatHealthSummary(events: NapCatHealthEvent[]): string {
+  const deduped = Array.from(
+    new Map(
+      events.map((event) => [`${event.qqAccount}:${event.status}`, event] as const),
+    ).values(),
+  );
+  const offline = deduped.filter((event) => event.status === 'error');
+  const online = deduped.filter((event) => event.status === 'running');
+  const lines: string[] = [];
+
+  const formatAccount = (event: NapCatHealthEvent): string => {
+    const roleLabel = event.role === 'main' ? '主账号' : '调度账号';
+    const accountLabel = event.nickname
+      ? `${event.nickname}（${event.qqAccount}）`
+      : event.qqAccount;
+    return `${roleLabel} ${accountLabel}`;
+  };
+
+  if (offline.length > 0) {
+    if (offline.length === 1) {
+      const event = offline[0];
+      lines.push(`⚠️ ${formatAccount(event)} 已掉线。`);
+      if (event.reason) {
+        lines.push(`原因：${event.reason}`);
+      }
+    } else {
+      lines.push(`⚠️ ${offline.length} 个账号已掉线：`);
+      for (const event of offline) {
+        lines.push(
+          event.reason
+            ? `- ${formatAccount(event)}：${event.reason}`
+            : `- ${formatAccount(event)}`,
+        );
+      }
+    }
+  }
+
+  if (online.length > 0) {
+    if (lines.length > 0) {
+      lines.push('');
+    }
+    if (online.length === 1) {
+      lines.push(`✅ ${formatAccount(online[0])} 已恢复在线。`);
+    } else {
+      lines.push(`✅ ${online.length} 个账号已恢复在线：`);
+      for (const event of online) {
+        lines.push(`- ${formatAccount(event)}`);
+      }
+    }
+  }
+
+  return lines.join('\n');
+}
+
+function clearProjectMemory(chatJid: string): void {
+  const group = registeredGroups[chatJid];
+  if (!group) {
+    throw new Error(`Chat ${chatJid} is not registered`);
+  }
+
+  clearChatContext(chatJid);
+
+  const groupDir = resolveGroupFolderPath(group.folder);
+  const claudePath = path.join(groupDir, 'CLAUDE.md');
+  fs.writeFileSync(claudePath, buildDefaultClaudeMdContent(group, chatJid));
+
+  const autoMemoryDir = path.join(DATA_DIR, 'sessions', group.folder, '.claude');
+  fs.rmSync(autoMemoryDir, { recursive: true, force: true });
+  fs.mkdirSync(autoMemoryDir, { recursive: true });
+
+  logger.info({ chatJid, folder: group.folder }, 'Cleared project memory');
 }
 
 function registerGroup(jid: string, group: RegisteredGroup): void {
@@ -432,6 +521,7 @@ async function runAgent(
         .filter((instance) => !instance.pendingLogin)
         .map((instance) => ({
           qqAccount: instance.qqAccount,
+          nickname: instance.nickname,
           role: instance.role,
           status: instance.status,
         }))
@@ -638,6 +728,10 @@ async function main(): Promise<void> {
   let _fleetManagerRef: NapCatFleetManager | null = null;
   const shutdown = async (signal: string) => {
     logger.info({ signal }, 'Shutdown signal received');
+    if (healthNotifyTimer) {
+      clearTimeout(healthNotifyTimer);
+      healthNotifyTimer = null;
+    }
     await queue.shutdown(10000);
     if (_fleetManagerRef) await _fleetManagerRef.stopAll();
     for (const ch of channels) await ch.disconnect();
@@ -734,10 +828,39 @@ async function main(): Promise<void> {
   let groupPool: GroupPoolManager | null = null;
   let taskManager: TeamTaskManager | null = null;
   let discussionEngine: DiscussionEngine | null = null;
+  let healthNotifyTimer: ReturnType<typeof setTimeout> | null = null;
+  const pendingHealthEvents: NapCatHealthEvent[] = [];
 
   if (fleetConfig.accounts.length > 0) {
     fleetManager = new NapCatFleetManager(fleetConfig);
     activeFleetManager = fleetManager;
+    const flushHealthEvents = async () => {
+      healthNotifyTimer = null;
+      if (pendingHealthEvents.length === 0) return;
+      const mainChatJid = getMainControlChatJid();
+      if (!mainChatJid) {
+        pendingHealthEvents.length = 0;
+        return;
+      }
+      const channel = findChannel(channels, mainChatJid);
+      if (!channel) {
+        pendingHealthEvents.length = 0;
+        return;
+      }
+
+      const snapshot = pendingHealthEvents.splice(0, pendingHealthEvents.length);
+      const text = formatNapCatHealthSummary(snapshot);
+      if (!text) return;
+      await channel.sendMessage(mainChatJid, text);
+    };
+    fleetManager.setHealthEventHandler(async (event) => {
+      pendingHealthEvents.push(event);
+      if (!healthNotifyTimer) {
+        healthNotifyTimer = setTimeout(() => {
+          void flushHealthEvents();
+        }, 8000);
+      }
+    });
 
     // Attach fleet manager to QQ bridge channel if present
     for (const ch of channels) {
@@ -1010,6 +1133,7 @@ async function main(): Promise<void> {
     requestBotLoginTicket: ipcRequestBotLoginTicket,
     clearChatContext,
     wipeChatMemory,
+    clearProjectMemory,
     updatePrivateLlmConfig: updatePrivateChatLlmConfig,
     syncGroups: async (force: boolean) => {
       await Promise.all(

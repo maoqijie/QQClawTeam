@@ -386,6 +386,27 @@ export async function runContainerAgent(
     let parseBuffer = '';
     let newSessionId: string | undefined;
     let outputChain = Promise.resolve();
+    let lastStreamedStatus: ContainerOutput['status'] | undefined;
+    const streamedOutputPayloads = new Set<string>();
+
+    const dispatchStreamedOutput = (jsonStr: string): void => {
+      try {
+        const parsed: ContainerOutput = JSON.parse(jsonStr);
+        if (parsed.newSessionId) {
+          newSessionId = parsed.newSessionId;
+        }
+        hadStreamingOutput = true;
+        lastStreamedStatus = parsed.status;
+        resetTimeout();
+        streamedOutputPayloads.add(jsonStr);
+        outputChain = outputChain.then(() => onOutput!(parsed));
+      } catch (err) {
+        logger.warn(
+          { group: group.name, error: err },
+          'Failed to parse streamed output chunk',
+        );
+      }
+    };
 
     container.stdout.on('data', (data) => {
       const chunk = data.toString();
@@ -418,23 +439,7 @@ export async function runContainerAgent(
             .trim();
           parseBuffer = parseBuffer.slice(endIdx + OUTPUT_END_MARKER.length);
 
-          try {
-            const parsed: ContainerOutput = JSON.parse(jsonStr);
-            if (parsed.newSessionId) {
-              newSessionId = parsed.newSessionId;
-            }
-            hadStreamingOutput = true;
-            // Activity detected — reset the hard timeout
-            resetTimeout();
-            // Call onOutput for all markers (including null results)
-            // so idle timers start even for "silent" query completions.
-            outputChain = outputChain.then(() => onOutput(parsed));
-          } catch (err) {
-            logger.warn(
-              { group: group.name, error: err },
-              'Failed to parse streamed output chunk',
-            );
-          }
+          dispatchStreamedOutput(jsonStr);
         }
       }
     });
@@ -497,6 +502,23 @@ export async function runContainerAgent(
     container.on('close', (code) => {
       clearTimeoutFn(timeout);
       const duration = nowFn() - startTime;
+
+      if (onOutput) {
+        let cursor = 0;
+        while (cursor < stdout.length) {
+          const startIdx = stdout.indexOf(OUTPUT_START_MARKER, cursor);
+          if (startIdx === -1) break;
+          const endIdx = stdout.indexOf(OUTPUT_END_MARKER, startIdx);
+          if (endIdx === -1) break;
+          const jsonStr = stdout
+            .slice(startIdx + OUTPUT_START_MARKER.length, endIdx)
+            .trim();
+          cursor = endIdx + OUTPUT_END_MARKER.length;
+          if (!streamedOutputPayloads.has(jsonStr)) {
+            dispatchStreamedOutput(jsonStr);
+          }
+        }
+      }
 
       if (timedOut) {
         const ts = new Date().toISOString().replace(/[:.]/g, '-');
@@ -562,7 +584,12 @@ export async function runContainerAgent(
         ``,
       ];
 
-      const isError = code !== 0;
+      const expectedStreamingTermination =
+        Boolean(onOutput) &&
+        hadStreamingOutput &&
+        lastStreamedStatus === 'success' &&
+        code === null;
+      const isError = code !== 0 && !expectedStreamingTermination;
 
       if (isVerbose || isError) {
         logLines.push(
@@ -603,7 +630,7 @@ export async function runContainerAgent(
       fs.writeFileSync(logFile, logLines.join('\n'));
       logger.debug({ logFile, verbose: isVerbose }, 'Container log written');
 
-      if (code !== 0) {
+      if (code !== 0 && !expectedStreamingTermination) {
         logger.error(
           {
             group: group.name,
@@ -628,7 +655,13 @@ export async function runContainerAgent(
       if (onOutput) {
         outputChain.then(() => {
           logger.info(
-            { group: group.name, duration, newSessionId },
+            {
+              group: group.name,
+              duration,
+              newSessionId,
+              code,
+              expectedStreamingTermination,
+            },
             'Container completed (streaming mode)',
           );
           resolve({
@@ -739,6 +772,7 @@ export interface AvailableGroup {
 
 export interface AvailableBotAccount {
   qqAccount: string;
+  nickname?: string;
   role: string;
   status: string;
 }

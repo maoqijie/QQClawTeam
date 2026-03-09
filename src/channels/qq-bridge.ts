@@ -561,19 +561,25 @@ function createRegisteredGroup(
   };
 }
 
+export function buildDefaultClaudeMdContent(
+  group: RegisteredGroup,
+  jid: string,
+): string {
+  return [
+    '# QQ Chat Context',
+    '',
+    `- Chat JID: ${jid}`,
+    `- Trigger: ${group.trigger}`,
+    `- Requires trigger: ${group.requiresTrigger === false ? 'no' : 'yes'}`,
+  ].join('\n');
+}
+
 function ensureGroupFiles(group: RegisteredGroup, jid: string): void {
   const groupDir = resolveGroupFolderPath(group.folder);
   fs.mkdirSync(path.join(groupDir, 'logs'), { recursive: true });
   const claudePath = path.join(groupDir, 'CLAUDE.md');
   if (!fs.existsSync(claudePath)) {
-    const content = [
-      '# QQ Chat Context',
-      '',
-      `- Chat JID: ${jid}`,
-      `- Trigger: ${group.trigger}`,
-      `- Requires trigger: ${group.requiresTrigger === false ? 'no' : 'yes'}`,
-    ].join('\n');
-    fs.writeFileSync(claudePath, content);
+    fs.writeFileSync(claudePath, buildDefaultClaudeMdContent(group, jid));
   }
 }
 

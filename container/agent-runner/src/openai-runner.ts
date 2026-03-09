@@ -190,7 +190,7 @@ function writePendingConfirmations(data: PendingConfirmationMap): void {
 }
 
 function getOrCreatePendingConfirmation(
-  action: 'clear_chat_context' | 'wipe_chat_memory',
+  action: 'clear_chat_context' | 'wipe_chat_memory' | 'clear_project_memory',
 ): PendingConfirmationEntry {
   const now = Date.now();
   const confirmations = readPendingConfirmations();
@@ -211,7 +211,7 @@ function getOrCreatePendingConfirmation(
 }
 
 function consumePendingConfirmation(
-  action: 'clear_chat_context' | 'wipe_chat_memory',
+  action: 'clear_chat_context' | 'wipe_chat_memory' | 'clear_project_memory',
   token: string | undefined,
   confirmed?: boolean,
 ): { ok: boolean; entry: PendingConfirmationEntry } {
@@ -709,6 +709,28 @@ function buildToolDefinitions(isMain: boolean): ChatCompletionTool[] {
   tools.push({
     type: 'function',
     function: {
+      name: 'clear_project_memory',
+      description:
+        'Clear project memory for the current chat by resetting the project CLAUDE.md to the default baseline and clearing the per-project .claude auto-memory directory. This does not delete stored chat history in the database or QQ client chat history.',
+      parameters: {
+        type: 'object',
+        properties: {
+          confirm_token: {
+            type: 'string',
+            description: 'Confirmation token returned by the previous clear_project_memory call. Required on the second step.',
+          },
+          confirmed: {
+            type: 'boolean',
+            description: 'Set to true after the user explicitly confirms the action. This can be used instead of repeating the token verbatim.',
+          },
+        },
+      },
+    },
+  });
+
+  tools.push({
+    type: 'function',
+    function: {
       name: 'show_private_llm_status',
       description:
         'Show the current private chat LLM backend/model configuration.',
@@ -1059,7 +1081,7 @@ function executeTool(
           return 'No bot account snapshot available yet.';
         }
         const payload = JSON.parse(fs.readFileSync(accountsFile, 'utf-8')) as {
-          accounts?: Array<{ qqAccount: string; role: string; status: string }>;
+          accounts?: Array<{ qqAccount: string; nickname?: string; role: string; status: string }>;
           lastSync?: string;
         };
         const accounts = payload.accounts || [];
@@ -1068,7 +1090,12 @@ function executeTool(
         }
         const lines = [
           `Connected bot accounts: ${accounts.length}`,
-          ...accounts.map((account) => `- ${account.qqAccount} (${account.role}, ${account.status})`),
+          ...accounts.map((account) => {
+            const label = account.nickname
+              ? `${account.nickname}（${account.qqAccount}）`
+              : account.qqAccount;
+            return `- ${label} (${account.role}, ${account.status})`;
+          }),
         ];
         if (payload.lastSync) {
           lines.push(`Last sync: ${payload.lastSync}`);
@@ -1135,6 +1162,24 @@ function executeTool(
           timestamp: new Date().toISOString(),
         });
         return 'Aggressive chat memory wipe requested. NanoClaw will forget this chat history and start fresh on the next user message.';
+      }
+
+      case 'clear_project_memory': {
+        const confirmation = consumePendingConfirmation(
+          'clear_project_memory',
+          args.confirm_token as string | undefined,
+          args.confirmed as boolean | undefined,
+        );
+        if (!confirmation.ok) {
+          return `Confirmation required before clearing project memory for this chat. This will reset the current project's CLAUDE.md to the default baseline and remove project auto-memory. Ask the user to explicitly confirm, then call clear_project_memory again with confirmed=true or confirm_token "${confirmation.entry.token}" before ${new Date(confirmation.entry.expiresAt).toLocaleString('zh-CN', { hour12: false })}. It does not delete QQ client chat history or the stored chat history database.`;
+        }
+
+        writeIpcFile(TASKS_DIR, {
+          type: 'clear_project_memory',
+          chatJid,
+          timestamp: new Date().toISOString(),
+        });
+        return 'Project memory clear requested. The project CLAUDE.md baseline and project auto-memory will be reset for this chat.';
       }
 
       case 'show_private_llm_status': {
@@ -1496,10 +1541,16 @@ function buildSystemPrompt(
     'When the user asks to clear, reset, or forget the current chat context, use the clear_chat_context tool. Explain that this only clears NanoClaw session context, not the QQ client chat history.',
   );
   parts.push(
+    'Treat phrases like “新开一个会话”, “重新开始”, “从头聊”, and “开个新上下文” as requests for clear_chat_context unless the user explicitly asks to also delete stored history.',
+  );
+  parts.push(
     'If the user explicitly wants a more aggressive wipe that also removes NanoClaw stored chat history for this chat, use the wipe_chat_memory tool. Make it clear that QQ client chat history is still not deleted.',
   );
   parts.push(
-    'Both clear_chat_context and wipe_chat_memory require a two-step confirmation. First call the tool without a confirmation to obtain the pending confirmation prompt. After the user explicitly confirms with phrases like “确认清理”, “确认删除”, “继续”, or “确定”, call the same tool again with confirmed=true. You may also use the returned confirm_token if needed, but confirmed=true should be enough when a valid pending confirmation exists.',
+    'If the user wants to clear project memory rather than chat history, use clear_project_memory. This should reset the current project CLAUDE.md to its default baseline and clear project auto-memory, while keeping stored chat history intact unless the user explicitly asks for a wipe.',
+  );
+  parts.push(
+    'clear_chat_context, wipe_chat_memory, and clear_project_memory all require a two-step confirmation. First call the tool without confirmation to obtain the pending confirmation prompt. After the user explicitly confirms with phrases like “确认清理”, “确认删除”, “继续”, or “确定”, call the same tool again with confirmed=true. You may also use the returned confirm_token if needed, but confirmed=true should be enough when a valid pending confirmation exists.',
   );
   parts.push('Your working directory is /workspace/group.');
   parts.push(`Current time: ${new Date().toISOString()}`);
